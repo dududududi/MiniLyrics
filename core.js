@@ -2,18 +2,24 @@
 (function (root) {
   'use strict';
   const finite = (x, fallback = 0) => Number.isFinite(Number(x)) ? Number(x) : fallback;
+  const wellFormed = value => {
+    const s = String(value);
+    return typeof s.toWellFormed === 'function'
+      ? s.toWellFormed()
+      : s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+  };
   function normalizeLines(input, options = {}) {
     if (!Array.isArray(input)) return [];
     const lines = input.slice(0, 5000).filter(l => l && typeof l==='object').map(l => {
       const time = Math.max(0, finite(l.time ?? l.startTime ?? l.start));
-      let text = String(l.originalLyric ?? l.lyric ?? l.text ?? l.content ?? '');
+      let text = wellFormed(l.originalLyric ?? l.lyric ?? l.text ?? l.content ?? '');
       const words = (Array.isArray(l.dynamicLyric) ? l.dynamicLyric : []).slice(0, 500).filter(w => w && typeof w==='object').map(w => {
         const t = finite(w.time);
-        return {text: String(w.word ?? w.text ?? ''), time: options.wordTiming === 'relative' ? time + t : t,
+        return {text: wellFormed(w.word ?? w.text ?? ''), time: options.wordTiming === 'relative' ? time + t : t,
           duration: Math.max(1, finite(w.duration, 1))};
       });
       if (!text) text = words.map(w => w.text).join('');
-      const translation = String(l.translatedLyric ?? l.translation ?? '');
+      const translation = wellFormed(l.translatedLyric ?? l.translation ?? '');
       return {time, duration: Math.max(0, finite(l.duration)), text, isInterlude: !!l.isInterlude || (!text && !translation),
         translation, words};
     });
@@ -22,10 +28,10 @@
   function metadata(info) {
     if(!info || typeof info!=='object') return null;
     const ncmId=finite(info.ncmId);
-    const id=String(info.trackId??(ncmId>0?ncmId:''));
+    const id=wellFormed(info.trackId??(ncmId>0?ncmId:''));
     if(!id)return null;
-    return {id,ncmId:ncmId>0?String(ncmId):'',title:String(info.songName??''),
-      artist:String(info.authorName??''),cover:String(info.cover?.url??''),
+    return {id,ncmId:ncmId>0?String(ncmId):'',title:wellFormed(info.songName??''),
+      artist:wellFormed(info.authorName??''),cover:wellFormed(info.cover?.url??''),
       duration:Math.max(0,finite(info.duration))};
   }
   // Reconcile a stale provider pause flag only after sustained, real-time progress.
@@ -71,6 +77,6 @@
       current:()=>output,snapshot:()=>({reportedPlaying:reported,playing:output,inferredFromProgress:inferred,
         progressSamples:run?.steps??0})};
   }
-  const api={finite, normalizeLines, metadata, createPlaybackState};
+  const api={finite, wellFormed, normalizeLines, metadata, createPlaybackState};
   if(typeof module!=='undefined') module.exports=api; else root.MiniLyricsCore=api;
 })(typeof window!=='undefined'?window:globalThis);

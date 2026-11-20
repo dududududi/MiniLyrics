@@ -25,7 +25,10 @@ test('actual queue structure lets one listener exception stop later listeners',(
  assert.throws(f.emit,/foreign-listener/);assert.equal(later,0);f.legacy.b.removeRegisterCall('PlayProgress','audioplayer',bad);f.emit();assert.equal(later,1);
 });
 test('MiniLyrics callback failures cannot interrupt later shared listeners',()=>{
- const f=fixture(),api=createPlayerAdapter(f.env);try{f.setState({playing:{resourceTrackId:'3437177548',onlineResourceId:3437177548,resourceArtists:{malformed:true},playingState:2}});
+ const f=fixture(),api=createPlayerAdapter(f.env);try{
+  const badPlaying={resourceTrackId:'3437177548',onlineResourceId:3437177548,playingState:2};
+  Object.defineProperty(badPlaying,'resourceArtists',{get(){throw new TypeError('malformed');}});
+  f.setState({playing:badPlaying});
  let later=0;f.internal.b.appendRegisterCall('PlayProgress','audioplayer',()=>later++);assert.doesNotThrow(()=>f.internal.a.queue('audioplayer.onPlayProgress')('3437177548_5D7DZG',195.899,1));assert.equal(later,1);
  }finally{api.dispose();}
 });

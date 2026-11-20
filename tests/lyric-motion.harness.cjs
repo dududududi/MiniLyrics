@@ -10,7 +10,7 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   const request=(m,type)=>new Promise((resolve,reject)=>{pending={type,resolve,timer:setTimeout(()=>{pending=null;reject(Error('timeout '+type));},5000)};send(m);});
   const inspect=()=>request({type:'inspect'},'inspection');
   const settings=m=>request({type:'test-settings',...m,...(m.motionWall!==undefined?{motionWall:m.motionWall+wallOffset}:{})},'test-settings-ack');
-  const clock=(position,playing=true,extra={})=>request({type:'clock',position,playing,valid:true,duration:90000,seekRequest:seq,...extra},'host-state');
+  const clock=async(position,playing=true,extra={})=>{await request({type:'clock',position,playing,valid:true,duration:90000,seekRequest:seq,...extra},'host-state');return inspect();};
   const track=(id,title)=>{seq=0;send({type:'track',id,title,artist:'RNP 整组运动',duration:90000,cover:''});};
   const lyrics=(id,lines,revision=1)=>request({type:'lyrics',songId:id,revision,lines},'lyrics-ack');
   const shot=async name=>{send({type:'capture'});const s=await inspect();fs.renameSync(capture,path.join(dir,name+'.png'));return s;};
@@ -59,7 +59,7 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   await clock(2250,false);const frozenScale=await shot('preview-paused-a');wallOffset+=200;await settings({motionWall:3450});const frozenLater=await shot('preview-paused-b');near(group(frozenScale,1).scale,group(frozenLater,1).scale);assert.ok(fs.readFileSync(path.join(dir,'preview-paused-a.png')).equals(fs.readFileSync(path.join(dir,'preview-paused-b.png'))));await clock(2250,true);
   s=await step(3700,2500);near(group(s,1).top,group(s,1).target);assert.ok(group(s,2).top>group(s,2).target);await shot('preview-500');
   s=await step(3750,2550);near(group(s,2).top,group(s,2).target);assert.equal(s.transitionActive,false);assert.ok(group(s,1).top-2>=s.viewportTop-.01);near(group(s,0).fontSize,16);assert.equal(group(s,0).rendered,false);near(group(s,1).fontSize,21);near(group(s,2).fontSize,16);assert.ok(group(s,2).top+group(s,2).mainHeight*group(s,2).scale<=s.viewportBottom+.01);await shot('preview-end');
-  const nextG=group(s,2);await request({type:'test-click',x,y:nextG.top+3},'test-click-ack');near(commands.at(-1).position,4000);await clock(4000,true,{seekState:'confirmed'});s=await inspect();assert.equal(s.transitionActive,false);
+  const nextG=group(s,2);await request({type:'test-click',x,y:nextG.top+3},'test-click-ack');near(commands.at(-1).position,4000);await clock(4000,true,{seekState:'confirmed'});s=await inspect();assert.equal(s.seekFlight,true);wallOffset+=900;await settings({motionWall:3750});s=await inspect();assert.equal(s.seekFlight,false);assert.equal(s.transitionActive,false);
   // A new target during a running transition starts from the exact presented positions.
   track('rapid','连续短句');await lyrics('rapid',[{time:0,text:'A'},{time:2000,text:'B'},{time:2200,text:'C'},{time:2400,text:'D'},{time:5000,text:'E'}]);
   await clock(1000);await step(4000,1800);const running=await step(4250,1999);s=await clock(2000);
@@ -74,6 +74,7 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   track('cache','有界缓存');await lyrics('cache',Array.from({length:50},(_,i)=>({time:i*1000,text:'第'+i+'句',translation:i%2?'Translation '+i:''})));
   for(let i=0;i<25;i++){s=await step(7000+i*300,i*1000+250);assert.ok(s.groups.length<=32);}
   // A long preview must stay pixel-identical while the short current lyric advances.
+  await request({type:'background',animated:false},'background-state');
   const longText='这是一句超出窗口宽度的预览歌词，固定从句首显示。'.repeat(3);
   track('fixed-preview','下一句预览固定');await lyrics('fixed-preview',[{time:0,text:'当前短句',duration:6000},{time:6000,text:longText,duration:6000},{time:12000,text:'后续歌词'}]);
   await settings({motionWall:16000});await clock(1000);await shot('fixed-preview-a');s=await step(17500,2500);await shot('fixed-preview-b');

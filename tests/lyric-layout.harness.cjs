@@ -8,7 +8,7 @@ const delay=ms=>new Promise(r=>setTimeout(r,ms));
   const send=m=>ws.send(JSON.stringify(m));
   const request=(m,type)=>new Promise((resolve,reject)=>{pending={type,resolve,timer:setTimeout(()=>{pending=null;reject(Error('timeout '+type));},5000)};send(m);});
   const settings=m=>request({type:'test-settings',...m},'test-settings-ack'),inspect=()=>request({type:'inspect'},'inspection');
-  const clock=(position,playing=true,extra={})=>request({type:'clock',position,playing,valid:true,duration:90000,seekRequest:seekId,...extra},'host-state');
+  const clock=async(position,playing=true,extra={})=>{await request({type:'clock',position,playing,valid:true,duration:90000,seekRequest:seekId,...extra},'host-state');return inspect();};
   const track=(id,title)=>{seekId=0;send({type:'track',id,title,artist:'统一布局 · 末句不收缩',duration:90000,cover:''});};
   const lyrics=(id,lines)=>request({type:'lyrics',songId:id,revision:1,lines},'lyrics-ack');
   const group=(s,i)=>{const g=s.groups.find(g=>g.index===i);assert.ok(g,'cached '+i);return g;};

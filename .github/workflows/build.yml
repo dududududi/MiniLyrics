@@ -48,8 +48,8 @@ jobs:
           ./build.ps1
           $version = (Get-Content -LiteralPath ./manifest.json -Raw | ConvertFrom-Json).version
           "version=$version" >> $env:GITHUB_OUTPUT
-      - name: Run paused lyric browsing focused checks
-        run: ./tests/native.ps1 -Focus paused-browse
+      - name: Run JS and native regression suites
+        run: ./tests/run-all.ps1 -CI
       - name: Stage market runtime
         env:
           SOURCE_COMMIT: ${{ github.sha }}

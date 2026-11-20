@@ -3,6 +3,7 @@
 #pragma once
 #include <windows.h>
 #include <tlhelp32.h>
+#include <algorithm>
 #include <vector>
 #include <string>
 class OwnerProcess {
@@ -49,9 +50,12 @@ class OwnerProcess {
    auto parentCreated=created(parent);
    if(!parentCreated||parentCreated>childCreated){CloseHandle(parent);return;}
    if(parentId==ownerId){
-    wchar_t path[32768];DWORD length=32768;
-    if(!QueryFullProcessImageNameW(parent,0,path,&length)){CloseHandle(parent);return;}
-    std::wstring image(path,length);auto separator=image.find_last_of(L"\\/");
+    std::wstring image(1024,L'\0');DWORD length=DWORD(image.size());
+    while(!QueryFullProcessImageNameW(parent,0,&image[0],&length)){
+     if(GetLastError()!=ERROR_INSUFFICIENT_BUFFER||image.size()>=32768){CloseHandle(parent);return;}
+     image.resize(std::min<size_t>(image.size()*2,32768));length=DWORD(image.size());
+    }
+    image.resize(length);auto separator=image.find_last_of(L"\\/");
     std::wstring name=image.substr(separator==std::wstring::npos?0:separator+1);
     if(_wcsicmp(name.c_str(),L"cloudmusic.exe")!=0){CloseHandle(parent);return;}
     owner=parent;return;

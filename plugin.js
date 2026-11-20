@@ -32,7 +32,7 @@
   function sendBackground(){send({type:'background',...background});}
   function changeBackground(patch){background=normalizeBackground({...background,...patch});try{plugin.setConfig?.('background',{...background});}catch(e){console.warn('[MiniLyrics] 背景设置保存失败',e);}sendBackground();}
   const listen=(target,name,fn)=>{target.addEventListener(name,fn);listeners.push([target,name,fn]);};
-  const send=m=>{if(socket?.readyState!==1)return;try{socket.send(JSON.stringify(m));}catch(e){console.debug('[MiniLyrics] 小窗消息发送失败',e);socket?.close();}};
+  const send=m=>{if(socket?.readyState!==1)return;try{socket.send(JSON.stringify(m,(_,v)=>typeof v==='string'?C.wellFormed(v):v));}catch(e){console.debug('[MiniLyrics] 小窗消息发送失败',e);socket?.close();}};
   const live=()=>position+(playing&&clockValid?Math.max(0,performance.now()-anchor):0);
   function providerId(d){
     if(d?.songID!=null||d?.songId!=null)return String(d.songID??d.songId);
@@ -94,10 +94,17 @@
     const nextPlaying=playback.sample(next,now,state,!!pendingSeek);
     let seekState=pendingSeek?'pending':'';
     if(pendingSeek&&actual){
-      const expected=pendingSeek.target+(nextPlaying?Math.max(0,now-pendingSeek.started):0);
-      // Actual position is authoritative, including an external seek that supersedes ours.
-      const reached=pendingSeek.startup?next>=pendingSeek.target-250&&next<=pendingSeek.target+(nextPlaying?Math.max(0,now-pendingSeek.started):0)+250:Math.abs(next-expected)<=250;
-      if((pendingSeek.sequence===undefined||t.sequence!==pendingSeek.sequence)&&(reached||!pendingSeek.startup&&(t.seek||Math.abs(next-live())>SEEK_TOLERANCE_MS))){clearSeek();seekState='confirmed';}
+      const elapsed=nextPlaying?Math.max(0,now-pendingSeek.started):0;
+      const expected=pendingSeek.target+elapsed;
+      // Startup progress after a missed synchronous seek may begin slightly ahead
+      // of target; reject bootstrap 0 / stale positions, accept authoritative seek.
+      const reached=pendingSeek.startup
+        ?next>=pendingSeek.target-250&&next<=expected+SEEK_TOLERANCE_MS
+        :Math.abs(next-expected)<=250;
+      const superseded=pendingSeek.startup
+        ?!!t.seek
+        :(!!t.seek||Math.abs(next-live())>SEEK_TOLERANCE_MS);
+      if((pendingSeek.sequence===undefined||t.sequence!==pendingSeek.sequence)&&(reached||superseded)){clearSeek();seekState='confirmed';}
     }
     if(next===sourcePosition&&nextPlaying===sourcePlaying&&kind===sourceKind&&seekState!=='confirmed')return false;
     sourcePosition=next;sourcePlaying=nextPlaying;sourceKind=kind;sourceAdvancedAt=now;
@@ -128,7 +135,8 @@
     if(!Number.isFinite(target))return;
     lastSeekId=Number(requestId)||lastSeekId+1;
     clearSeek();playback.resetProgress();
-    const own={id:lastSeekId,songId:song.id,target,startup:!!player?.getDiagnostics?.()?.control&&player.getDiagnostics().control.phase!=='loaded',sequence:player?.getTimeline?.()?.sequence,started:performance.now(),previous:live()};pendingSeek=own;
+    const control=player?.getDiagnostics?.()?.control;
+    const own={id:lastSeekId,songId:song.id,target,startup:!!control&&control.phase!=='loaded',sequence:player?.getTimeline?.()?.sequence,started:performance.now(),previous:live()};pendingSeek=own;
     seekTimer=setTimeout(()=>failSeek(own,'跳转未确认'),SEEK_TIMEOUT_MS);
     sendClock('pending');
     try{
@@ -188,9 +196,11 @@
     try{attachPlayer();sample();}catch(e){console.debug('[MiniLyrics] 恢复同步失败',e);}
   }
   function refreshStatus(){
-    if(!statusView)return;
+    if(!statusView||statusView.isConnected===false)return;
     const state=playerAdapter.getDiagnostics?.()?.streamState,labels={'waiting-player':'播放器未就绪','waiting-subscription':'等待播放器初始化','subscription-lost':'播放同步已中断','waiting-progress':'等待实际播放进度','events-filtered':'收到进度但未接受','progress-stalled':'播放进度已中断','progress-live':'进度正常','progress-paused':'播放已暂停'};
-    const text=status+' · 进度：'+(labels[state]??(player?'网易云播放器':'等待 网易云播放器'))+' · '+Math.floor(live()/1000)+' 秒 · RNP 歌词 '+lines.length+' 行 · 小窗确认：'+(hostState?.lyricCount??'待回报');if(statusView.textContent!==text)statusView.textContent=text;
+    const rnpMissing=lyricMode==='waiting'&&typeof loadedPlugins==='object'&&loadedPlugins&&Object.keys(loadedPlugins).length>0&&!loadedPlugins.RefinedNowPlayingNext&&!window.currentLyrics;
+    const lyricHint=rnpMissing?'（未检测到 RNPNext）':'';
+    const text=status+' · 进度：'+(labels[state]??(player?'网易云播放器':'等待 网易云播放器'))+' · '+Math.floor(live()/1000)+' 秒 · RNP 歌词 '+lines.length+' 行'+lyricHint+' · 小窗确认：'+(hostState?.lyricCount??'待回报');if(statusView.textContent!==text)statusView.textContent=text;
   }
   function connectSocket(port){
     const ws=new WebSocket(`ws://127.0.0.1:${port}/`);
@@ -207,8 +217,10 @@
     ws.close();
   }
   async function retireHost(port,token){
-    await new Promise(r=>setTimeout(r,200));
-    try{retireSocket(await connectSocket(port),token);}catch{}
+    for(let i=0;i<6;i++){
+      await new Promise(r=>setTimeout(r,200));
+      try{const ws=await connectSocket(port);if(ws){retireSocket(ws,token);return;}}catch{}
+    }
   }
   function retireWindow(own,ws=null){
     if(own.retired){ws?.close();return;}
@@ -253,7 +265,7 @@
     if(song.id){
       send({type:'track',...song});
       if(lastAppliedRnp)send({type:'lyrics',songId:song.id,revision:++lyricRevision,mode:lyricMode,lines});
-      if(clockValid)sendClock();
+      if(clockValid||offset!==0)sendClock();
     }
     sendFont();sendRnpStyle(true);sendBackground();
     status='已连接';tick();
@@ -341,7 +353,8 @@
   plugin.onConfig(()=>{
     const el=document.createElement('div');el.style.cssText='padding:24px;line-height:1.8;max-width:700px';
     const title=document.createElement('h2');title.textContent='MiniLyrics 音乐小窗';el.append(title);
-    for(const [text,fn]of [['打开 / 找回小窗',open],['退出鼠标穿透',()=>send({type:'unlock'})],['重置位置和尺寸',()=>send({type:'reset'})],['关闭小窗',closeWindow]]){
+    const requireSocket=fn=>()=>{if(socket?.readyState===1)fn();else{status='小窗未连接，请先打开小窗';refreshStatus();}};
+    for(const [text,fn]of [['打开 / 找回小窗',open],['退出鼠标穿透',requireSocket(()=>send({type:'unlock'}))],['重置位置和尺寸',requireSocket(()=>send({type:'reset'}))],['关闭小窗',closeWindow]]){
       const b=document.createElement('button');b.textContent=text;b.style.cssText='padding:8px 14px;margin:0 8px 12px 0';b.onclick=fn;el.append(b);}
     const p=document.createElement('p');p.textContent='拖动封面移动，右下角缩放；滚轮回看歌词，点击歌词跳转。右键小窗可调整翻译、置顶和帧率。';el.append(p);
     const fontHeading=document.createElement('h3');fontHeading.textContent='歌词字体';el.append(fontHeading);
@@ -373,7 +386,7 @@
     progressSource:player?'网易云播放器':'未同步',positionMs:live(),playing,valid:clockValid,lyricCount:lines.length,
     lyricMode,lyricSource:lyricMode==='waiting'?'等待 RNP':lyricMode==='empty'?'RNP 暂无歌词':'RNP 歌词',lyricRevision,rnpSongId:providerId(window.currentLyrics),
     host:hostState,playerVersion:player?.version??null,playerFresh:playerTimelineFresh(),playerDiagnostics:playerAdapter.getDiagnostics?.()??null,
-    seekPending:!!pendingSeek,seekRequest:lastSeekId,playbackState:playback.snapshot(),background:{...background}})};
+    seekPending:!!pendingSeek,seekRequest:lastSeekId,playbackState:playback.snapshot(),fontSize,background:{...background}})};
   listen(window,'rnp-lyric-page-opened',resyncPage);
   listen(window,'rnp-lyric-page-closed',resyncPage);
   listen(window,'focus',resyncPage);

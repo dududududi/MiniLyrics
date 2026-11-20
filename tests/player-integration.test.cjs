@@ -72,3 +72,12 @@ test('settings distinguish initialization, filtered progress and a stalled strea
   f.advance(5000);assert.match(status.textContent,/播放进度已中断/);assert.equal(f.diagnostics().playerDiagnostics.progressAgeMs,5000);
  }finally{f.dispose();}
 });
+test('superseding external native Seek during cold-start startup clears seekPending immediately',async()=>{
+ const f=fixture({actualPlayer:true,coldPlayer:true,deferStartup:true});try{
+  await f.open();f.seek(50000);assert.equal(f.diagnostics().seekPending,true);
+  f.completeNativeStartup();f.advance(1000);
+  emitNative(f,'Seek','local-a','external-seek',0,15);
+  assert.equal(f.diagnostics().seekPending,false);
+  assert.equal(f.diagnostics().positionMs,15000);
+ }finally{f.dispose();}
+});

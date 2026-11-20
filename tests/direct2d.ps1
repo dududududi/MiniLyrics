@@ -4,6 +4,7 @@ $pluginDirectory=Split-Path $PSScriptRoot
 $resultDirectory=Join-Path (Get-Location) ('work/'+$Label)
 New-Item -ItemType Directory -Force $resultDirectory | Out-Null
 $env:MINILYRICS_SETTINGS=Join-Path $resultDirectory 'settings.json'
+if (Test-Path -LiteralPath $env:MINILYRICS_SETTINGS) { Remove-Item -LiteralPath $env:MINILYRICS_SETTINGS -Force }
 $capture=Join-Path $resultDirectory 'capture.png'
 $probe=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
 $probe.Start();$port=$probe.LocalEndpoint.Port;$probe.Stop()

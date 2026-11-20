@@ -16,7 +16,13 @@ const execFile=util.promisify(cp.execFile),delay=ms=>new Promise(r=>setTimeout(r
   const request=(m,type)=>new Promise((resolve,reject)=>{pending={type,resolve,timer:setTimeout(()=>{pending=null;reject(Error('timeout '+type));},5000)};send(m);});
   const inspect=()=>request({type:'inspect'},'inspection');
   const captureFrame=async name=>{send({type:'capture'});await inspect();for(let i=0;i<100;i++){try{await fs.access(capture);break;}catch{await delay(10);}}await fs.rename(capture,path.join(dir,name+'.png'));return inspect();};
-  const action=(type,x,y)=>execFile(path.join(__dirname,'window-probe.exe'),[String(native.pid),type,String(Math.round(x)),String(Math.round(y))]);
+  const probeExe=path.join(__dirname,'window-probe.exe');
+  let activeProbe=probeExe;
+  if(!require('node:fs').existsSync(probeExe)){
+   activeProbe=path.join(dir,'window-probe.exe');
+   await execFile('g++',['-std=c++17','-O2','-DUNICODE','-D_UNICODE',path.join(__dirname,'window-probe.cpp'),'-o',activeProbe]);
+  }
+  const action=(type,x,y)=>execFile(activeProbe,[String(native.pid),type,String(Math.round(x)),String(Math.round(y))]);
   const click=async(x,y)=>{await request({type:'test-settings',hover:true},'test-settings-ack');await action('down',x,y);await action('up',x,y);await inspect();};
   const clock=(position,id=0,seekState='')=>request({type:'clock',songId:'seek-test',position,playing:false,valid:true,duration:90000,seekRequest:id,seekState},'host-state');
   send({type:'hello',token:'0123456789abcdef0123456789abcdef'});
@@ -32,12 +38,13 @@ const execFile=util.promisify(cp.execFile),delay=ms=>new Promise(r=>setTimeout(r
    await action('down',x,y);await captureFrame('dragging-'+width);
    await action('up',x,y);const released=await captureFrame('released-'+width);
    const seek=commands.at(-1);assert.equal(seek.action,'seek');assert.equal(seek.songId,'seek-test');
-   assert.ok(Math.abs(released.positionMs-seek.position)<1);assert.equal(released.seekPending,true);
-   // A pre-seek clock already queued in the bridge cannot undo the optimistic position.
+   assert.ok(Math.abs(released.positionMs-10000)<1);assert.equal(released.seekPending,true);
+   // A pre-seek clock already queued in the bridge keeps actual position until confirmed.
    send({type:'clock',songId:'seek-test',position:10000,playing:false,valid:true,seekRequest:0});
-   assert.ok(Math.abs((await inspect()).positionMs-seek.position)<1);
-   await clock(seek.position,seek.requestId,'pending');assert.equal((await inspect()).seekPending,true);
-   await clock(seek.position,seek.requestId,'confirmed');assert.equal((await inspect()).seekPending,false);
+   assert.ok(Math.abs((await inspect()).positionMs-10000)<1);
+   await clock(10000,seek.requestId,'pending');assert.equal((await inspect()).seekPending,true);
+   await clock(seek.position,seek.requestId,'confirmed');
+   const confirmed=await inspect();assert.equal(confirmed.seekPending,false);assert.ok(Math.abs(confirmed.positionMs-seek.position)<1);
    await captureFrame('confirmed-'+width);
    for(const [field,expected]of [['previousPx','previous'],['playPx','play'],['nextPx','next']]){
     const count=commands.length;await click(s[field],y);assert.equal(commands.length,count+1);assert.equal(commands.at(-1).action,expected);
@@ -52,8 +59,12 @@ const execFile=util.promisify(cp.execFile),delay=ms=>new Promise(r=>setTimeout(r
   await click(left+length*.2,y);const second=commands.at(-1);
   assert.ok(second.requestId>first.requestId);
   send({type:'clock',songId:'seek-test',position:first.position,playing:false,valid:true,seekRequest:first.requestId,seekState:'confirmed'});
-  s=await inspect();assert.equal(s.seekPending,true);assert.ok(Math.abs(s.positionMs-second.position)<1);
-  await clock(10000,second.requestId,'failed');assert.equal((await inspect()).seekPending,false);
+  s=await inspect();assert.equal(s.seekPending,true);
+  await clock(second.position,second.requestId,'confirmed');
+  s=await inspect();assert.equal(s.seekPending,false);assert.ok(Math.abs(s.positionMs-second.position)<1);
+  await clock(10000,second.requestId);
+  await click(left+length*.5,y);assert.equal((await inspect()).seekPending,true);
+  await clock(10000,commands.at(-1).requestId,'failed');assert.equal((await inspect()).seekPending,false);
   await click(left+length*.5,y);assert.equal((await inspect()).seekPending,true);
   await delay(3650);s=await inspect();assert.equal(s.seekPending,false);assert.equal(s.error,'seek-timeout');assert.ok(Math.abs(s.positionMs-10000)<1);
   const result={pass:true,layouts,oldClockIgnored:true,latestSeekWins:true,failureRestores:true,timeoutRestores:true,buttonHitTests:9,dpi:s.dpi};

@@ -37,7 +37,7 @@ static constexpr double MinWindowHeight=130;
 static constexpr float CurrentFontSize=21,ContextFontSize=16,TranslationFontSize=16,GroupGap=7,TranslationGap=6.3f;
 static double nowMs(){static auto origin=std::chrono::steady_clock::now();return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-origin).count();}
 static double clamp(double x,double lo,double hi){return std::max(lo,std::min(hi,std::isfinite(x)?x:lo));}
-static std::wstring widen(const std::string&s){if(s.empty())return {};int n=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,s.data(),int(s.size()),nullptr,0);if(n<=0)return {};std::wstring out(n,0);MultiByteToWideChar(CP_UTF8,0,s.data(),int(s.size()),&out[0],n);return out;}
+static std::wstring widen(const std::string&s){if(s.empty())return {};int n=MultiByteToWideChar(CP_UTF8,0,s.data(),int(s.size()),nullptr,0);if(n<=0)return {};std::wstring out(n,0);MultiByteToWideChar(CP_UTF8,0,s.data(),int(s.size()),&out[0],n);return out;}
 static std::string narrow(const std::wstring&s){if(s.empty())return {};int n=WideCharToMultiByte(CP_UTF8,0,s.data(),int(s.size()),nullptr,0,nullptr,nullptr);std::string out(n,0);WideCharToMultiByte(CP_UTF8,0,s.data(),int(s.size()),&out[0],n,nullptr,nullptr);return out;}
 static std::wstring env(const wchar_t*name){DWORD n=GetEnvironmentVariableW(name,nullptr,0);if(!n)return {};std::wstring out(n,0);GetEnvironmentVariableW(name,&out[0],n);out.resize(n-1);return out;}
 static void check(HRESULT hr){if(FAILED(hr))throw std::runtime_error("Windows graphics initialization failed ("+std::to_string(uint32_t(hr))+")");}
@@ -62,51 +62,72 @@ struct LyricFlight {
  FlightPoint sample(const FlightRow&r,const Phase&p)const{return {mixf(r.from.y,r.to.y,p.p[r.bucket]),mixf(r.from.zoom,r.to.zoom,p.p[r.bucket]),mixf(r.from.mainAlpha,r.to.mainAlpha,p.alpha),mixf(r.from.subAlpha,r.to.subAlpha,p.alpha),mixf(r.from.opacity,r.to.opacity,p.alpha)};}
 };
 struct CoverData {uint64_t epoch=0;UINT width=0,height=0;std::vector<BYTE> pixels;};
-struct CoverQueue {std::mutex mutex;std::condition_variable changed;bool stop=false,pending=false;std::wstring url;uint64_t epoch=0;};
+struct CoverQueue {
+ std::mutex mutex;std::condition_variable changed;bool stop=false,pending=false;std::wstring url;uint64_t epoch=0;HINTERNET activeRequest=nullptr;
+ void cancelActiveRequest(){HINTERNET req=nullptr;{std::lock_guard<std::mutex> lock(mutex);req=activeRequest;activeRequest=nullptr;}if(req)WinHttpCloseHandle(req);}
+};
 
-static std::unique_ptr<CoverData> downloadCover(const std::wstring&url,uint64_t epoch){
- auto out=std::make_unique<CoverData>();out->epoch=epoch;
- URL_COMPONENTS parts{};parts.dwStructSize=sizeof(parts);parts.dwHostNameLength=parts.dwUrlPathLength=parts.dwExtraInfoLength=DWORD(-1);
- if(!WinHttpCrackUrl(url.c_str(),0,0,&parts)||(parts.nScheme!=INTERNET_SCHEME_HTTP&&parts.nScheme!=INTERNET_SCHEME_HTTPS))return out;
- std::wstring host(parts.lpszHostName,parts.dwHostNameLength),path(parts.lpszUrlPath,parts.dwUrlPathLength);
- if(parts.dwExtraInfoLength)path.append(parts.lpszExtraInfo,parts.dwExtraInfoLength);if(path.empty())path=L"/";
- HINTERNET session=WinHttpOpen(L"MiniLyrics/0.2",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);if(!session)return out;
- WinHttpSetTimeouts(session,3000,3000,8000,8000);
- HINTERNET connection=WinHttpConnect(session,host.c_str(),parts.nPort,0),request=nullptr;std::vector<BYTE> bytes;
- if(connection)request=WinHttpOpenRequest(connection,L"GET",path.c_str(),nullptr,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,parts.nScheme==INTERNET_SCHEME_HTTPS?WINHTTP_FLAG_SECURE:0);
- if(request&&WinHttpSendRequest(request,WINHTTP_NO_ADDITIONAL_HEADERS,0,WINHTTP_NO_REQUEST_DATA,0,0,0)&&WinHttpReceiveResponse(request,nullptr)){
-  DWORD status=0,size=sizeof(status);WinHttpQueryHeaders(request,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,nullptr,&status,&size,nullptr);
-  if(status==200){BYTE buf[8192];DWORD got=0;while(WinHttpReadData(request,buf,sizeof(buf),&got)&&got){if(bytes.size()+got>8*1024*1024){bytes.clear();break;}bytes.insert(bytes.end(),buf,buf+got);}}
+struct CoverDownloader {
+ HINTERNET session=nullptr;Com<IWICImagingFactory> factory;bool comInit=false;
+ CoverDownloader(){
+  HRESULT hr=CoInitializeEx(nullptr,COINIT_MULTITHREADED);comInit=SUCCEEDED(hr);
+  session=WinHttpOpen(L"MiniLyrics/0.8",WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,0);
+  if(session)WinHttpSetTimeouts(session,3000,3000,8000,8000);
  }
- if(request)WinHttpCloseHandle(request);if(connection)WinHttpCloseHandle(connection);WinHttpCloseHandle(session);if(bytes.empty())return out;
- HRESULT init=CoInitializeEx(nullptr,COINIT_MULTITHREADED);
- try{
-  Com<IWICImagingFactory> factory;check(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(factory.put())));
-  Com<IWICStream> stream;check(factory->CreateStream(stream.put()));check(stream->InitializeFromMemory(bytes.data(),DWORD(bytes.size())));
-  Com<IWICBitmapDecoder> decoder;check(factory->CreateDecoderFromStream(stream.get(),nullptr,WICDecodeMetadataCacheOnLoad,decoder.put()));
-  Com<IWICBitmapFrameDecode> frame;check(decoder->GetFrame(0,frame.put()));UINT w=0,h=0;check(frame->GetSize(&w,&h));if(!w||!h||w>8192||h>8192||uint64_t(w)*h>32*1024*1024)throw std::runtime_error("cover dimensions");
-  // Keep enough detail for the 160-DIP cover at up to 300% display scaling.
-  // The animated background independently downsamples this artwork to 192px.
-  double scale=std::min(1.,512./std::max(w,h));out->width=std::max(1u,UINT(w*scale));out->height=std::max(1u,UINT(h*scale));
-  Com<IWICBitmapScaler> scaler;check(factory->CreateBitmapScaler(scaler.put()));check(scaler->Initialize(frame.get(),out->width,out->height,WICBitmapInterpolationModeFant));
-  Com<IWICFormatConverter> converter;check(factory->CreateFormatConverter(converter.put()));check(converter->Initialize(scaler.get(),GUID_WICPixelFormat32bppPBGRA,WICBitmapDitherTypeNone,nullptr,0,WICBitmapPaletteTypeCustom));
-  out->pixels.resize(size_t(out->width)*out->height*4);check(converter->CopyPixels(nullptr,out->width*4,UINT(out->pixels.size()),out->pixels.data()));
- }catch(...){out->width=out->height=0;out->pixels.clear();}
- if(SUCCEEDED(init))CoUninitialize();return out;
-}
+ ~CoverDownloader(){factory.reset();if(session)WinHttpCloseHandle(session);if(comInit)CoUninitialize();}
+ std::unique_ptr<CoverData> fetch(const std::wstring&url,uint64_t epoch,CoverQueue*queue=nullptr){
+  auto out=std::make_unique<CoverData>();out->epoch=epoch;if(!session)return out;
+  URL_COMPONENTS parts{};parts.dwStructSize=sizeof(parts);parts.dwHostNameLength=parts.dwUrlPathLength=parts.dwExtraInfoLength=DWORD(-1);
+  if(!WinHttpCrackUrl(url.c_str(),0,0,&parts)||(parts.nScheme!=INTERNET_SCHEME_HTTP&&parts.nScheme!=INTERNET_SCHEME_HTTPS))return out;
+  std::wstring host(parts.lpszHostName,parts.dwHostNameLength),path(parts.lpszUrlPath,parts.dwUrlPathLength);
+  if(parts.dwExtraInfoLength)path.append(parts.lpszExtraInfo,parts.dwExtraInfoLength);if(path.empty())path=L"/";
+  HINTERNET connection=WinHttpConnect(session,host.c_str(),parts.nPort,0),request=nullptr;std::vector<BYTE> bytes;
+  if(connection)request=WinHttpOpenRequest(connection,L"GET",path.c_str(),nullptr,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,parts.nScheme==INTERNET_SCHEME_HTTPS?WINHTTP_FLAG_SECURE:0);
+  if(request&&queue){std::lock_guard<std::mutex> lock(queue->mutex);if(queue->stop||queue->epoch!=epoch){WinHttpCloseHandle(request);request=nullptr;}else queue->activeRequest=request;}
+  if(request&&WinHttpSendRequest(request,WINHTTP_NO_ADDITIONAL_HEADERS,0,WINHTTP_NO_REQUEST_DATA,0,0,0)&&WinHttpReceiveResponse(request,nullptr)){
+   DWORD status=0,size=sizeof(status);WinHttpQueryHeaders(request,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,nullptr,&status,&size,nullptr);
+   if(status==200){BYTE buf[8192];DWORD got=0;while(WinHttpReadData(request,buf,sizeof(buf),&got)&&got){if(bytes.size()+got>8*1024*1024){bytes.clear();break;}bytes.insert(bytes.end(),buf,buf+got);}}
+  }
+  if(request){if(queue){queue->cancelActiveRequest();}else WinHttpCloseHandle(request);}
+  if(connection)WinHttpCloseHandle(connection);if(bytes.empty())return out;
+  try{
+   if(!factory)check(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(factory.put())));
+   Com<IWICStream> stream;check(factory->CreateStream(stream.put()));check(stream->InitializeFromMemory(bytes.data(),DWORD(bytes.size())));
+   Com<IWICBitmapDecoder> decoder;check(factory->CreateDecoderFromStream(stream.get(),nullptr,WICDecodeMetadataCacheOnLoad,decoder.put()));
+   Com<IWICBitmapFrameDecode> frame;check(decoder->GetFrame(0,frame.put()));UINT w=0,h=0;check(frame->GetSize(&w,&h));if(!w||!h||w>8192||h>8192||uint64_t(w)*h>32*1024*1024)throw std::runtime_error("cover dimensions");
+   // Keep enough detail for the 160-DIP cover at up to 300% display scaling.
+   // The animated background independently downsamples this artwork to 192px.
+   double scale=std::min(1.,512./std::max(w,h));out->width=std::max(1u,UINT(w*scale));out->height=std::max(1u,UINT(h*scale));
+   Com<IWICBitmapScaler> scaler;check(factory->CreateBitmapScaler(scaler.put()));check(scaler->Initialize(frame.get(),out->width,out->height,WICBitmapInterpolationModeFant));
+   Com<IWICFormatConverter> converter;check(factory->CreateFormatConverter(converter.put()));check(converter->Initialize(scaler.get(),GUID_WICPixelFormat32bppPBGRA,WICBitmapDitherTypeNone,nullptr,0,WICBitmapPaletteTypeCustom));
+   out->pixels.resize(size_t(out->width)*out->height*4);check(converter->CopyPixels(nullptr,out->width*4,UINT(out->pixels.size()),out->pixels.data()));
+  }catch(...){out->width=out->height=0;out->pixels.clear();}
+  return out;
+ }
+};
+
+inline std::unique_ptr<CoverData> downloadCover(const std::wstring&url,uint64_t epoch){CoverDownloader downloader;return downloader.fetch(url,epoch);}
 
 struct Graphics {
- ID2D1RenderTarget*target=nullptr;Com<ID2D1SolidColorBrush> brush;Com<ID2D1LinearGradientBrush> gradient;Com<ID2D1Bitmap> cover,background;Com<ID2D1BitmapBrush> backgroundBrush;uint64_t backgroundRevision=0;
- void clear(){backgroundBrush.reset();background.reset();backgroundRevision=0;cover.reset();gradient.reset();brush.reset();target=nullptr;}
+ ID2D1RenderTarget*target=nullptr;Com<ID2D1SolidColorBrush> brush;Com<ID2D1LinearGradientBrush> gradient;Com<ID2D1Bitmap> cover,background;Com<ID2D1BitmapBrush> coverBrush,backgroundBrush;uint64_t backgroundRevision=0;bool coverOpaque=true;
+ void clear(){backgroundBrush.reset();background.reset();backgroundRevision=0;coverBrush.reset();cover.reset();coverOpaque=true;gradient.reset();brush.reset();target=nullptr;}
  void resize(float w,float h){if(gradient)gradient->SetEndPoint(D2D1::Point2F(w,h*.5f));}
  void updateGradient(D2D1_COLOR_F a,D2D1_COLOR_F b,float w,float h){
   D2D1_GRADIENT_STOP stops[]={{0,a},{1,b}};Com<ID2D1GradientStopCollection> collection;Com<ID2D1LinearGradientBrush> next;
   check(target->CreateGradientStopCollection(stops,2,collection.put()));check(target->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(0,0),D2D1::Point2F(w,h*.5f)),collection.get(),next.put()));gradient=std::move(next);
  }
  void updateCover(const CoverData&image){
-  if(image.pixels.empty()){cover.reset();return;}
-  if(cover&&cover->GetPixelSize().width==image.width&&cover->GetPixelSize().height==image.height){check(cover->CopyFromMemory(nullptr,image.pixels.data(),image.width*4));return;}
-  Com<ID2D1Bitmap> next;check(target->CreateBitmap(D2D1::SizeU(image.width,image.height),image.pixels.data(),image.width*4,D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),next.put()));cover=std::move(next);
+  if(image.pixels.empty()){coverBrush.reset();cover.reset();coverOpaque=true;return;}
+  bool opaque=true;for(size_t i=3;i<image.pixels.size();i+=4)if(image.pixels[i]<255){opaque=false;break;}
+  coverOpaque=opaque;
+  if(cover&&cover->GetPixelSize().width==image.width&&cover->GetPixelSize().height==image.height){
+   check(cover->CopyFromMemory(nullptr,image.pixels.data(),image.width*4));
+   if(!coverBrush)check(target->CreateBitmapBrush(cover.get(),D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP,D2D1_EXTEND_MODE_CLAMP,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR),coverBrush.put()));
+   return;
+  }
+  Com<ID2D1Bitmap> next;check(target->CreateBitmap(D2D1::SizeU(image.width,image.height),image.pixels.data(),image.width*4,D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),next.put()));
+  Com<ID2D1BitmapBrush> nextBrush;check(target->CreateBitmapBrush(next.get(),D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP,D2D1_EXTEND_MODE_CLAMP,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR),nextBrush.put()));
+  cover=std::move(next);coverBrush=std::move(nextBrush);
  }
  void init(ID2D1RenderTarget*t,D2D1_COLOR_F a,D2D1_COLOR_F b,const CoverData&image,float w,float h){
   clear();target=t;check(t->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White),brush.put()));
@@ -120,7 +141,7 @@ class App {
  static constexpr UINT Incoming=WM_APP+1,CoverReady=WM_APP+2,FrameReady=WM_APP+3,BridgeDisconnected=WM_APP+4;
  HWND hwnd=nullptr;HANDLE frameTimer=nullptr;bool frameArmed=false;double frameDeadline=0,framePeriod=0;std::unique_ptr<Bridge> bridge;
  ModalFrames modalFrames;OwnerProcess ownerProcess;bool systemMoving=false,connectionStale=false;
- std::shared_ptr<CoverQueue> coverQueue;
+ std::shared_ptr<CoverQueue> coverQueue;std::thread coverWorker;
  Com<ID2D1Factory> factory;Com<IDWriteFactory> textFactory;Com<IWICImagingFactory> imaging;
  Com<ID2D1HwndRenderTarget> target;Graphics graphics;Com<ID2D1RoundedRectangleGeometry> coverClip;
  Com<IDWriteTextFormat> mainFormat,secondaryFormat,metaFormat;
@@ -136,6 +157,7 @@ class App {
  double savedX=80,savedY=80,savedWidth=360,savedHeight=130;float dpi=96,width=360,height=130,artSize=96,textX=124;
  bool positionInPixels=false;
  SIZE geometryPixels{};float geometryDpi=0;
+ RECT normalWindowRect{};float normalWindowScale=1.f;bool hasNormalRect=false;
  bool playing=false,valid=false,hasClock=false,untimed=false,lyricsReceived=false,through=false,top=true,translation=true,hover=false,dragProgress=false,resizing=false,closing=false,hardware=false,frameRunning=false;
  bool demo=false,renderVisible=false;int fps=60,index=-999;UINT intervalMs=200;uint64_t renderCalls=0,lineBuildCalls=0,coverEpoch=0;double dragRatio=0;
  POINT resizeStart{};SIZE resizeSize{};
@@ -143,14 +165,14 @@ class App {
  double animationWall()const{return testWall?testWallMs:nowMs();}
  double motionNow()const{return motion.now(animationWall());}
  void stopBrowsing(bool animateReturn=false){browseIndex=-1;wheelRemainder=0;browseUntil=0;returnFromBrowse=true;manualTransition=manualLayoutPending=animateReturn;KillTimer(hwnd,4);layoutDirty=true;}
- void finishTransition(){for(auto&item:groups){auto&g=item.second;g.y.snap(g.y.to);g.zoom.snap(g.zoom.to);g.mainAlpha.snap(g.mainAlpha.to);g.subAlpha.snap(g.subAlpha.to);}transitionActive=false;}
+ void finishTransition(){for(auto&item:groups){auto&g=item.second;g.y.snap(g.y.to);g.zoom.snap(g.zoom.to);g.mainAlpha.snap(g.mainAlpha.to);g.subAlpha.snap(g.subAlpha.to);}transitionActive=false;manualTransition=false;manualLayoutPending=false;}
  float scale()const{return dpi/96.f;}
  float lyricAnchor()const{return height/2+4-(mainRowHeight*(1+contextFontSize/currentFontSize)+11)/2;}
  enum class LyricView {Waiting,StaticPreview,Prelude,Rows};
  bool staticPreview()const{return untimed||(!valid&&!hasClock);}
  LyricView lyricView()const{if(lines.empty())return LyricView::Waiting;if(browseIndex>=0)return LyricView::Rows;if(staticPreview())return LyricView::StaticPreview;return index<0?LyricView::Prelude:LyricView::Rows;}
  float rowAnchor()const{return lyricAnchor()+(lyricView()==LyricView::Prelude?mainRowHeight+GroupGap:0);}
- bool emptyGroup(const LyricGroup&g)const{return g.model.text.empty()&&g.glyphs.empty()&&!g.translated;}
+ bool emptyGroup(const LyricGroup&g)const{return g.model.text.empty()&&g.model.words.empty()&&g.glyphs.empty()&&!g.translated;}
  bool isInterlude(const Line&line)const{return line.isInterlude||(line.text.empty()&&line.words.empty()&&line.translation.empty());}
  bool isInterlude(const LyricGroup&g)const{return isInterlude(g.model);}
  std::pair<int,int> browseBounds()const{int first=0,last=int(lines.size())-1;while(first<=last&&isInterlude(lines[first]))++first;while(last>=first&&isInterlude(lines[last]))--last;return first<=last?std::make_pair(first,last):std::make_pair(-1,-1);}
@@ -181,15 +203,20 @@ class App {
   placeholder=Layout();updatePlaceholders();save();update();
  }
  void rebuildMeta(){metaLayout=layout(title+(artist.empty()?L"":L"  ·  "+artist),metaFormat.get(),std::max(20.f,width-textX-85));if(metaLayout.value){DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};Com<IDWriteInlineObject>sign;if(SUCCEEDED(textFactory->CreateEllipsisTrimmingSign(metaFormat.get(),sign.put())))metaLayout.value->SetTrimming(&trim,sign.get());}}
+ void ensureGlyphs(LyricGroup&g){
+  if(!g.glyphs.empty()||g.model.words.empty())return;
+  float x=0;
+  for(const auto&word:g.model.words){Glyph glyph;glyph.layout=layout(word.text,mainFormat.get());glyph.x=x;glyph.time=word.time;glyph.duration=word.duration;x+=glyph.layout.width;g.mainHeight=std::max(g.mainHeight,glyph.layout.height);g.glyphs.push_back(std::move(glyph));}
+ }
  LyricGroup& group(int at){
   auto result=groups.try_emplace(at);auto&g=result.first->second;const auto&line=lines[at];
-  if(!result.second&&g.model==line&&g.translated==(translation&&!line.translation.empty()))return g;
+  if(!result.second&&g.model==line&&g.translated==(translation&&!line.translation.empty())){if(at==index)ensureGlyphs(g);return g;}
   bool same=!result.second&&g.model.time==line.time&&g.model.text==line.text;
   auto y=g.y,z=g.zoom,ma=g.mainAlpha,sa=g.subAlpha;auto dots=g.dots;float opacity=g.opacity;bool placed=g.placed;uint64_t id=same?g.identity:++groupSerial;
   g=LyricGroup();g.model=line;g.identity=id;g.translated=translation&&!line.translation.empty();g.y=y;g.zoom=z;g.placed=placed;g.mainAlpha=ma;g.subAlpha=sa;g.opacity=opacity;
   if(same)g.dots=dots;
   g.main=layout(line.text,mainFormat.get());g.mainHeight=g.main.height;
-  float x=0;for(const auto&word:line.words){Glyph glyph;glyph.layout=layout(word.text,mainFormat.get());glyph.x=x;glyph.time=word.time;glyph.duration=word.duration;x+=glyph.layout.width;g.mainHeight=std::max(g.mainHeight,glyph.layout.height);g.glyphs.push_back(std::move(glyph));}
+  if(at==index)ensureGlyphs(g);
   if(g.mainHeight<=0)g.mainHeight=mainRowHeight;
   if(g.translated)g.subtitle=layout(line.translation,secondaryFormat.get());
   g.mainAlpha.snap(at==index?1.f:.4f);g.subAlpha.snap(at==index?.8f:.4f);g.active=at==index;lineBuildCalls++;return g;
@@ -208,7 +235,7 @@ class App {
  }
  void roles(){
   double now=motionNow(),time=current()+offset;
-  for(auto&item:groups){auto&g=item.second;bool active=item.first==index;if(active==g.active)continue;
+  for(auto&item:groups){auto&g=item.second;bool active=item.first==index;if(active)ensureGlyphs(g);if(active==g.active)continue;
    if(g.active){g.resetWords.clear();for(const auto&w:g.glyphs)g.resetWords.push_back(floatWord(time-w.time,w.duration));g.resetAt=now;}
    g.active=active;g.mainAlpha.target(active?1.f:.4f,now);g.subAlpha.target(active?.8f:.4f,now);
   }
@@ -235,11 +262,11 @@ class App {
   for(size_t i=0;i<flight.rows.size();i++){const auto&r=flight.rows[i];if(r.point.y+r.height*r.point.zoom>=viewportTop-mainRowHeight*2&&r.point.y<=viewportBottom+mainRowHeight*2)add(int(i));}
   for(int i=flight.focus-2;i<=flight.focus+2;i++)add(i);
   for(auto it=groups.begin();it!=groups.end();)if(std::find(wanted.begin(),wanted.end(),it->first)==wanted.end())it=groups.erase(it);else ++it;
-  for(int id:wanted){auto&g=group(id);const auto&p=flight.rows[id].point;g.y.snap(p.y);g.zoom.snap(p.zoom);g.mainAlpha.snap(p.mainAlpha);g.subAlpha.snap(p.subAlpha);g.opacity=p.opacity;g.placed=true;g.active=id==index;g.browsePlaceholder=false;}
+  for(int id:wanted){auto&g=group(id);const auto&p=flight.rows[id].point;g.y.snap(p.y);g.zoom.snap(p.zoom);g.mainAlpha.snap(p.mainAlpha);g.subAlpha.snap(p.subAlpha);g.opacity=p.opacity;g.placed=true;g.active=id==index;if(g.active)ensureGlyphs(g);g.browsePlaceholder=false;}
   focusIndex=flight.focus;layoutAnchor=lyricAnchor()+(flight.prelude?mainRowHeight+GroupGap:0);layoutDirty=false;
  }
  void seekTo(double target){
-  target=std::max(0.,duration>0?std::min(duration,target):target);bool canFly=!untimed&&valid&&!lines.empty()&&focusIndex>=0&&!groups.empty();
+  target=std::max(0.,duration>0?std::min(duration,target):target);bool canFly=renderVisible&&!untimed&&valid&&!lines.empty()&&focusIndex>=0&&!groups.empty();
   if(canFly){int actual=rowAt(target+offset),desired=std::max(0,rowAt(target+offset+(playing&&stagger?200:0)));beginFlight(desired,actual);}else flight=LyricFlight();
   if(browseIndex>=0&&!untimed)stopBrowsing();returnFromBrowse=false;error.clear();snapRow=!canFly;position=target;anchor=nowMs();valid=true;layoutDirty=true;
  }
@@ -247,19 +274,36 @@ class App {
   if(lines.empty()){groups.clear();focusIndex=-1;transitionActive=false;layoutDirty=false;return;}
   desired=std::max(0,std::min(int(lines.size())-1,desired));int previous=focusIndex;
   std::vector<int>wanted;auto add=[&](int n){if(n>=0&&n<int(lines.size())&&std::find(wanted.begin(),wanted.end(),n)==wanted.end())wanted.push_back(n);};
-  add(desired);int before=desired,after=desired;bool up=true,down=true;
+  add(desired);group(desired);
+  float newAnchor=rowAnchor();
+  std::map<int,float>targets;targets[desired]=newAnchor;
+  auto bounds=browseIndex>=0?browseBounds():std::make_pair(-1,-1);
+  auto included=[&](int n){return browseIndex<0||(n>=bounds.first&&n<=bounds.second);};
+  int before=desired,after=desired,prevUp=desired,prevDown=desired;float yUp=newAnchor,yDown=newAnchor;bool up=true,down=true;
   // Fill the viewport plus a row of overscan, retaining a bounded working set.
   while((up||down)&&wanted.size()<28){for(int direction:{-1,1}){bool&more=direction<0?up:down;int&at=direction<0?before:after;if(!more)continue;
    at=browseIndex>=0?browseNeighbor(at,direction):at+direction;if(at<0||at>=int(lines.size())){more=false;continue;}
-   add(at);auto&g=group(at);float y=positionFor(at,desired,rowAnchor());more=direction<0?y+g.renderedHeight(groupScale(at,desired))>=viewportTop-mainRowHeight:y<=viewportBottom+mainRowHeight;
+   add(at);auto&g=group(at);
+   float y=0;
+   if(direction<0){
+    if(at==prevUp-1)yUp-=included(at)?(g.renderedHeight(groupScale(at,desired))+GroupGap):0.f;
+    else yUp=positionFor(at,desired,newAnchor);
+    prevUp=at;y=yUp;
+   }else{
+    if(at==prevDown+1){const auto&pg=group(prevDown);yDown+=included(prevDown)?(pg.renderedHeight(groupScale(prevDown,desired))+GroupGap):0.f;}
+    else yDown=positionFor(at,desired,newAnchor);
+    prevDown=at;y=yDown;
+   }
+   targets[at]=y;
+   more=direction<0?y+g.renderedHeight(groupScale(at,desired))>=viewportTop-mainRowHeight:y<=viewportBottom+mainRowHeight;
   }}
   for(int d=-2;d<=2;d++)add(index+d);
   for(int n:wanted)group(n);
-  float newAnchor=rowAnchor();
   double now=motionNow();int direction=desired>=previous?1:-1;
   for(int n:wanted){auto&g=group(n);g.opacity=1;
    if(!g.placed){int initial=previous>=0&&animate?previous:desired;g.y.snap(positionFor(n,initial,previous>=0&&animate?layoutAnchor:newAnchor));g.zoom.snap(groupScale(n,initial));g.placed=true;}
-   float target=positionFor(n,desired,newAnchor);
+   auto itTarget=targets.find(n);
+   float target=itTarget!=targets.end()?itTarget->second:positionFor(n,desired,newAnchor);
    if(animate){double delay=browseIndex>=0||returnFromBrowse||previous==desired?0:rnpDelay(n-desired,direction,stagger),duration=browseIndex>=0?250:500;g.y.target(target,now,delay,duration,lineCurve);g.zoom.target(groupScale(n,desired),now,delay,duration,lineCurve);}else{g.y.snap(target);g.zoom.snap(groupScale(n,desired));}
   }
   layoutAnchor=newAnchor;focusIndex=desired;
@@ -268,7 +312,7 @@ class App {
    if(!keep&&(!animate||!it->second.y.active(now)||y+it->second.renderedHeight(it->second.zoom.value(now))<viewportTop-8||y>viewportBottom+8))it=groups.erase(it);else ++it;
   }
   while(groups.size()>32){auto farthest=groups.end();for(auto it=groups.begin();it!=groups.end();++it)if(it->first!=index&&(farthest==groups.end()||std::abs(it->first-desired)>std::abs(farthest->first-desired)))farthest=it;if(farthest==groups.end())break;groups.erase(farthest);}
-  auto bounds=browseIndex>=0?browseBounds():std::make_pair(-1,-1);for(auto&item:groups)item.second.browsePlaceholder=browseIndex>=0&&item.first>bounds.first&&item.first<bounds.second&&isInterlude(item.second);
+  for(auto&item:groups)item.second.browsePlaceholder=browseIndex>=0&&item.first>bounds.first&&item.first<bounds.second&&isInterlude(item.second);
   if(previous!=desired){rowSince=now;layoutChanges++;}
   roles();layoutDirty=false;
  }
@@ -277,11 +321,12 @@ class App {
   placeholder=layout(lyricsReceived&&lines.empty()?L"暂无歌词":L"等待歌词",mainFormat.get());
   preludePreview=-1;for(size_t i=0;i<lines.size();i++){const auto&line=lines[i];if(!line.isInterlude&&(!line.text.empty()||!line.translation.empty()||std::any_of(line.words.begin(),line.words.end(),[](const Word&w){return !w.text.empty();}))){preludePreview=int(i);break;}}
  }
+ void recordNormalBounds(){if(!hwnd||IsIconic(hwnd))return;RECT r{};if(GetWindowRect(hwnd,&r)&&r.right>r.left&&r.bottom>r.top){normalWindowRect=r;normalWindowScale=scale();hasNormalRect=true;}}
  bool geometry(){
   RECT rect{};GetClientRect(hwnd,&rect);
   if(geometryPixels.cx==rect.right&&geometryPixels.cy==rect.bottom&&geometryDpi==dpi)return false;
   // Record this before SetWindowRgn, which sends nested window-position messages.
-  geometryPixels={rect.right,rect.bottom};geometryDpi=dpi;flight=LyricFlight();
+  geometryPixels={rect.right,rect.bottom};geometryDpi=dpi;flight=LyricFlight();recordNormalBounds();
   width=std::max(1.f,float(rect.right)/scale());height=std::max(1.f,float(rect.bottom)/scale());
   auto art=coverGeometry(rect.right,rect.bottom,scale());artSize=art.side;artRadius=art.radius;
   artBounds=D2D1::RectF(art.left,art.top,art.left+art.side,art.top+art.side);textX=artBounds.right+16;transport=transportGeometry(width,height,textX,scale());
@@ -297,7 +342,7 @@ class App {
   if(!target){auto props=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_HARDWARE,D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN,D2D1_ALPHA_MODE_UNKNOWN),dpi,dpi);
    HRESULT hr=factory->CreateHwndRenderTarget(props,D2D1::HwndRenderTargetProperties(hwnd,D2D1::SizeU(std::max(1L,rect.right),std::max(1L,rect.bottom)),D2D1_PRESENT_OPTIONS_IMMEDIATELY),target.put());hardware=SUCCEEDED(hr);
    if(FAILED(hr)){props.type=D2D1_RENDER_TARGET_TYPE_SOFTWARE;check(factory->CreateHwndRenderTarget(props,D2D1::HwndRenderTargetProperties(hwnd,D2D1::SizeU(std::max(1L,rect.right),std::max(1L,rect.bottom)),D2D1_PRESENT_OPTIONS_IMMEDIATELY),target.put()));}
-   target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+   target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
   }if(!graphics.target)graphics.init(target.get(),bgA,bgB,cover,width,height);
  }
  void text(Graphics&g,const Layout&l,float x,float y,D2D1_COLOR_F color,float alpha=1){if(!l.value)return;g.brush->SetColor(color);g.brush->SetOpacity(alpha);g.target->DrawTextLayout(D2D1::Point2F(x,y),l.value.get(),g.brush.get(),D2D1_DRAW_TEXT_OPTIONS_NONE);g.brush->SetOpacity(1);}
@@ -308,10 +353,10 @@ class App {
   const Line*line=&g.model;
   return float(clamp((time-line->time-900)/std::max(1200.,(line->duration>0?line->duration:4000)-1600),0,1));
  }
- float horizontalPhase(const LyricGroup&g,double time,int id)const{
+ float horizontalPhase(const LyricGroup&g,double time,int id,double now)const{
   if(g.glyphs.empty())return timedHorizontalPhase(g,time,id);
   if(!canScroll(id))return 0;
-  float zoom=std::max(.01f,g.zoom.value(motionNow())),available=std::max(1.f,width-textX-12),overflow=rowWidth(g)*zoom-available;
+  float zoom=std::max(.01f,g.zoom.value(now)),available=std::max(1.f,width-textX-12),overflow=rowWidth(g)*zoom-available;
   if(overflow<=0)return 0;
   const auto&last=g.glyphs.back();if(time>=last.time+last.duration)return 1;
   // Track the sung position in measured text space. Gaps hold this cursor;
@@ -320,31 +365,42 @@ class App {
   for(const auto&w:g.glyphs)if(time>=w.time)cursor=std::max(cursor,w.x+w.layout.width*float(unit((time-w.time)/w.duration)));
   return float(clamp((cursor*zoom-available*.5f)/overflow,0,1));
  }
- void drawInterlude(Graphics&g,const InterludeAnimation&animation,float x,float y,double time,double start,double duration,float opacity=1,bool stationary=false){
-  float alpha=opacity*(stationary?1.f:animation.opacity.value(motionNow()));if(alpha<=0)return;
-  float breath=stationary?1.f:animation.scale(motionNow()),diameter=currentFontSize*.7f,gap=currentFontSize*.5f;
+ float horizontalPhase(const LyricGroup&g,double time,int id)const{return horizontalPhase(g,time,id,motionNow());}
+ void drawInterludeAt(Graphics&g,const InterludeAnimation&animation,float x,float y,double time,double start,double duration,double now,float opacity=1,bool stationary=false){
+  float alpha=opacity*(stationary?1.f:animation.opacity.value(now));if(alpha<=0)return;
+  float breath=stationary?1.f:animation.scale(now),diameter=currentFontSize*.7f,gap=currentFontSize*.5f;
   g.brush->SetColor(D2D1::ColorF(D2D1::ColorF::White));
-  for(int i=0;i<3;i++){auto dot=stationary?InterludeDot{.4f,.9f}:animation.dot(time,start,duration,i,motionNow());float radius=diameter*.5f*dot.scale*breath;g.brush->SetOpacity(alpha*dot.alpha);g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x+(diameter*.5f+i*(diameter+gap))*breath,y+mainRowHeight*.5f),radius,radius),g.brush.get());}
+  for(int i=0;i<3;i++){auto dot=stationary?InterludeDot{.4f,.9f}:animation.dot(time,start,duration,i,now);float radius=diameter*.5f*dot.scale*breath;g.brush->SetOpacity(alpha*dot.alpha);g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x+(diameter*.5f+i*(diameter+gap))*breath,y+mainRowHeight*.5f),radius,radius),g.brush.get());}
   g.brush->SetOpacity(1);
  }
- void drawGroup(Graphics&g,const LyricGroup&r,int id,double time){
-  if(r.opacity<=0)return;double now=motionNow();float zoom=std::max(.01f,r.zoom.value(now)),y=r.y.value(now);
-  float available=std::max(1.f,width-textX-12),phase=horizontalPhase(r,time,id);
+ void drawInterlude(Graphics&g,const InterludeAnimation&animation,float x,float y,double time,double start,double duration,float opacity=1,bool stationary=false){
+  drawInterludeAt(g,animation,x,y,time,start,duration,motionNow(),opacity,stationary);
+ }
+ void drawGroupAt(Graphics&g,const LyricGroup&r,int id,double time,double now){
+  if(r.opacity<=0)return;float zoom=std::max(.01f,r.zoom.value(now)),y=r.y.value(now);
+  float available=std::max(1.f,width-textX-12),phase=horizontalPhase(r,time,id,now);
   D2D1_MATRIX_3X2_F transform;bool scaled=zoom!=1.f;float originX=textX,originY=y;
   if(scaled){g.target->GetTransform(&transform);g.target->SetTransform(D2D1::Matrix3x2F::Scale(zoom,zoom)*D2D1::Matrix3x2F::Translation(textX,y)*transform);originX=originY=0;}
-  if(staticInterlude(r)){drawInterlude(g,r.dots,originX,originY,0,0,0,r.opacity,true);if(scaled)g.target->SetTransform(transform);return;}
+  if(staticInterlude(r)){drawInterludeAt(g,r.dots,originX,originY,0,0,0,now,r.opacity,true);if(scaled)g.target->SetTransform(transform);return;}
   float x=originX-std::max(0.f,rowWidth(r)*zoom-available)*phase/zoom;
-  if(r.glyphs.empty()||staticPreview())text(g,r.main,x,originY,D2D1::ColorF(D2D1::ColorF::White),(staticPreview()?(id==focusIndex?1.f:.4f):r.mainAlpha.value(now))*r.opacity);
-  else for(size_t i=0;i<r.glyphs.size();i++){
-   const auto&w=r.glyphs[i];FloatWord f{.4f,0};
-   if(r.active)f=floatWord(time-w.time,w.duration);
-   else if(i<r.resetWords.size()&&now-r.resetAt<200){double p=unit((now-r.resetAt)/200);f={mixf(r.resetWords[i].alpha,.4f,p),mixf(r.resetWords[i].lift,0,lyricEase(p))};}
-   text(g,w.layout,x+w.x,originY-f.lift,D2D1::ColorF(D2D1::ColorF::White),f.alpha*r.opacity);
+  bool resetting=!r.active&&!r.resetWords.empty()&&now-r.resetAt<200;
+  if(r.glyphs.empty()||staticPreview()||(!r.active&&!resetting))text(g,r.main,x,originY,D2D1::ColorF(D2D1::ColorF::White),(staticPreview()?(id==focusIndex?1.f:.4f):r.mainAlpha.value(now))*r.opacity);
+  else{
+   float clipLeft=originX-2.f,clipRight=originX+available/zoom+2.f;
+   for(size_t i=0;i<r.glyphs.size();i++){
+    const auto&w=r.glyphs[i];float wx=x+w.x;
+    if(wx+w.layout.width<clipLeft||wx>clipRight)continue;
+    FloatWord f{.4f,0};
+    if(r.active)f=floatWord(time-w.time,w.duration);
+    else if(i<r.resetWords.size()){double p=unit((now-r.resetAt)/200);f={mixf(r.resetWords[i].alpha,.4f,p),mixf(r.resetWords[i].lift,0,lyricEase(p))};}
+    text(g,w.layout,wx,originY-f.lift,D2D1::ColorF(D2D1::ColorF::White),f.alpha*r.opacity);
+   }
   }
-  if(indicatorVisible(r))drawInterlude(g,r.dots,originX,originY,time,r.model.time,interludeDuration(r.model,id),r.mainAlpha.value(now)*r.opacity);
+  if(indicatorVisible(r))drawInterludeAt(g,r.dots,originX,originY,time,r.model.time,interludeDuration(r.model,id),now,r.mainAlpha.value(now)*r.opacity);
   if(r.translated){float subX=originX-std::max(0.f,r.subtitle.width*zoom-available)*timedHorizontalPhase(r,time,id)/zoom;text(g,r.subtitle,subX,originY+r.subtitleOffset(1.f),D2D1::ColorF(D2D1::ColorF::White),(staticPreview()?(id==focusIndex?.8f:.4f):r.subAlpha.value(now))*r.opacity);}
   if(scaled)g.target->SetTransform(transform);
  }
+ void drawGroup(Graphics&g,const LyricGroup&r,int id,double time){drawGroupAt(g,r,id,time,motionNow());}
  bool backgroundPlaying()const{return renderVisible&&background.mode>0&&background.animated&&playing&&valid;}
  bool backgroundAnimating()const{return !resizing&&backgroundPlaying();}
  Json backgroundState()const{Json j=Json::obj();j["mode"]=background.mode;j["animated"]=background.animated;j["speed"]=background.speed;j["fps"]=background.fps;return j;}
@@ -360,33 +416,47 @@ class App {
   if(background.mode==0){g.target->FillRoundedRectangle(card,g.gradient.get());return;}
   // Reuse the last texture while sizing; pending cover/settings changes and
   // the final dimensions are applied after mouse capture ends.
-  if(!resizing||fluid.pixels.empty()){double wall=animationWall();fluid.setSize(width,height);fluid.prepare(background,backgroundClock.time(wall),backgroundClock.position(wall));}
+  bool liveWindow=(g.target==target.get())&&backgroundAnimating()&&!resizing;
+  if(!resizing||fluid.pixels.empty()){double wall=animationWall();fluid.setSize(width,height);fluid.prepare(background,backgroundClock.time(wall),backgroundClock.position(wall),liveWindow);}
   if(!g.background){check(g.target->CreateBitmap(D2D1::SizeU(FluidBackground::width,FluidBackground::height),fluid.pixels.data(),FluidBackground::width*4,D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),g.background.put()));check(g.target->CreateBitmapBrush(g.background.get(),D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP,D2D1_EXTEND_MODE_CLAMP,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR),g.backgroundBrush.put()));g.backgroundRevision=fluid.revision;}
   else if(g.backgroundRevision!=fluid.revision){check(g.background->CopyFromMemory(nullptr,fluid.pixels.data(),FluidBackground::width*4));g.backgroundRevision=fluid.revision;}
   g.backgroundBrush->SetTransform(D2D1::Matrix3x2F::Scale(width/FluidBackground::width,height/FluidBackground::height));g.target->FillRoundedRectangle(card,g.backgroundBrush.get());
  }
- void drawLyrics(Graphics&g,double time){
-  float y=lyricAnchor();if(!flight.rows.empty()){if(preludeDots.visible(motionNow()))drawInterlude(g,preludeDots,textX,y,time,0,lines.front().time);}
+ void drawLyricsAt(Graphics&g,double time,double now){
+  float y=lyricAnchor();if(!flight.rows.empty()){if(preludeDots.visible(now))drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,now);}
   else switch(lyricView()){
    case LyricView::Waiting:text(g,placeholder,textX,y,D2D1::ColorF(D2D1::ColorF::White));return;
    case LyricView::StaticPreview:break;
-   case LyricView::Prelude:drawInterlude(g,preludeDots,textX,y,time,0,lines.front().time);break;
+   case LyricView::Prelude:drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,now);break;
    case LyricView::Rows:break;
   }
-  for(const auto&item:groups)if(groupVisible(item.second,motionNow()))drawGroup(g,item.second,item.first,time);
+  for(const auto&item:groups)if(groupVisible(item.second,now))drawGroupAt(g,item.second,item.first,time,now);
  }
+ void drawLyrics(Graphics&g,double time){drawLyricsAt(g,time,motionNow());}
  void draw(Graphics&g){
-  auto*t=g.target;double time=current()+offset;
+  auto*t=g.target;double time=current()+offset,now=motionNow();
 
   t->Clear(D2D1::ColorF(0,0));auto card=D2D1::RoundedRect(D2D1::RectF(.5f,.5f,width-.5f,height-.5f),17,17);drawBackground(g,card);g.brush->SetColor(D2D1::ColorF(.62f,.65f,.80f,.65f));t->DrawRoundedRectangle(card,g.brush.get(),1);
-  // One rounded mask for both layers avoids accumulated antialiasing halos.
-  t->PushLayer(D2D1::LayerParameters(artBounds,coverClip.get()),nullptr);
-  g.brush->SetColor(D2D1::ColorF(.33f,.39f,.51f));t->FillRectangle(artBounds,g.brush.get());
-  if(g.cover){float side=float(std::min(cover.width,cover.height)),x=(cover.width-side)/2,y=(cover.height-side)/2;t->DrawBitmap(g.cover.get(),artBounds,playing?float(clamp((nowMs()-coverSince)/250,0,1)):1,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,D2D1::RectF(x,y,x+side,y+side));}
-  t->PopLayer();
+  float coverAlpha=(g.cover&&playing)?float(clamp((nowMs()-coverSince)/250,0,1)):1.f;
+  if(!g.cover){
+   g.brush->SetColor(D2D1::ColorF(.33f,.39f,.51f));
+   t->FillRoundedRectangle(D2D1::RoundedRect(artBounds,artRadius,artRadius),g.brush.get());
+  }else if(g.coverBrush&&coverAlpha>=.999f&&g.coverOpaque){
+   float side=float(std::min(cover.width,cover.height)),x=(cover.width-side)/2,y=(cover.height-side)/2;
+   float scaleArt=artSize/std::max(1.f,side);
+   g.coverBrush->SetTransform(D2D1::Matrix3x2F::Translation(-x,-y)*D2D1::Matrix3x2F::Scale(scaleArt,scaleArt)*D2D1::Matrix3x2F::Translation(artBounds.left,artBounds.top));
+   t->FillRoundedRectangle(D2D1::RoundedRect(artBounds,artRadius,artRadius),g.coverBrush.get());
+  }else{
+   // One rounded mask for both layers avoids accumulated antialiasing halos.
+   t->PushLayer(D2D1::LayerParameters(artBounds,coverClip.get()),nullptr);
+   g.brush->SetColor(D2D1::ColorF(.33f,.39f,.51f));t->FillRectangle(artBounds,g.brush.get());
+   float side=float(std::min(cover.width,cover.height)),x=(cover.width-side)/2,y=(cover.height-side)/2;
+   t->DrawBitmap(g.cover.get(),artBounds,coverAlpha,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,D2D1::RectF(x,y,x+side,y+side));
+   t->PopLayer();
+  }
   text(g,metaLayout,textX,12,D2D1::ColorF(.87f,.89f,.94f));
   t->PushAxisAlignedClip(D2D1::RectF(textX,viewportTop,width-12,viewportBottom),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-  drawLyrics(g,time);
+  drawLyricsAt(g,time,now);
   t->PopAxisAlignedClip();
   if(hover&&!through){
    float y=transport.y;g.brush->SetColor(D2D1::ColorF(.55f,.58f,.69f));t->DrawLine(D2D1::Point2F(textX,y),D2D1::Point2F(transport.right,y),g.brush.get(),3);
@@ -435,7 +505,7 @@ class App {
  }
  void update(){
   if(valid)hasClock=true;
-  if(!renderVisible||!valid||untimed)manualTransition=manualLayoutPending=false;
+  if(!renderVisible||(!valid&&!untimed))manualTransition=manualLayoutPending=false;
   // Browse animation can run while paused; the playback and background clocks stay separate.
   if(browseIndex>=0&&(lines.empty()||(!untimed&&animationWall()>=browseUntil))){
    bool animateReturn=renderVisible&&valid&&!untimed&&!lines.empty();
@@ -444,7 +514,7 @@ class App {
    }
    stopBrowsing(animateReturn);
   }
-  motion.setRunning(renderVisible&&valid&&!untimed&&(playing||manualTransition),animationWall());backgroundClock.update(backgroundAnimating(),background.speed,animationWall());
+  motion.setRunning(renderVisible&&((valid&&!untimed&&playing)||manualTransition),animationWall());backgroundClock.update(backgroundAnimating(),background.speed,animationWall());
   if(!renderVisible){stopFrames();return;}
   if(!valid&&!flight.rows.empty()){flight=LyricFlight();layoutDirty=true;}
   if(browseIndex>=0){int normalized=browseFocus(browseIndex);if(normalized<0)stopBrowsing();else if(normalized!=browseIndex){browseIndex=normalized;layoutDirty=true;}}
@@ -465,7 +535,7 @@ class App {
   else if(snapRow||focusIndex<0||groups.empty()||(!playing&&actualChanged))desired=std::max(0,index);
   else if(returnFromBrowse)desired=std::max(0,playing&&valid?rowAt(time+(stagger?200:0)):index);
   else if(playing&&valid)desired=std::max(0,rowAt(time+(stagger?200:0)));
-  bool animate=(playing||manualLayoutPending)&&valid&&!untimed&&!snapRow&&focusIndex>=0&&layoutDistance(desired,focusIndex,4)<=3;
+  bool animate=((playing&&valid&&!untimed)||manualLayoutPending)&&!snapRow&&focusIndex>=0&&layoutDistance(desired,focusIndex,4)<=3;
   if(snapRow)layoutDirty=true;
   // Prelude and the first active row can share an index but use different anchors.
   bool reflowed=layoutDirty||desired!=focusIndex||groups.empty()||layoutAnchor!=rowAnchor();if(reflowed)reflow(desired,animate);
@@ -476,10 +546,10 @@ class App {
   if(lyricView()==LyricView::Rows)for(auto&item:groups){auto&g=item.second;bool stationary=staticInterlude(g);if((browseIndex>=0&&isInterlude(g)&&!stationary)||(emptyGroup(g)&&!indicatorVisible(g)&&!stationary))continue;bool visible=groupVisible(g,now);bool crosses=std::min(g.y.from,g.y.to)<=viewportBottom&&std::max(g.y.from,g.y.to)+g.renderedHeight(std::max(g.zoom.from,g.zoom.to))>=viewportTop;transitionActive=transitionActive||(g.y.active(now)&&crosses)||(visible&&(g.zoom.active(now)||(!stationary&&(g.mainAlpha.active(now)||g.subAlpha.active(now)||(!g.active&&!g.resetWords.empty()&&now-g.resetAt<200)))));}
   bool layoutActive=false;for(const auto&item:groups){const auto&g=item.second;layoutActive=layoutActive||g.y.active(now)||g.zoom.active(now);}
   manualTransition=manualTransition&&layoutActive;manualLayoutPending=false;
-  motion.setRunning(renderVisible&&valid&&!untimed&&(playing||manualTransition),animationWall());
+  motion.setRunning(renderVisible&&((valid&&!untimed&&playing)||manualTransition),animationWall());
   InvalidateRect(hwnd,nullptr,FALSE);schedule();
  }
- void paint(){PAINTSTRUCT ps{};BeginPaint(hwnd,&ps);if(renderVisible)try{ensureTarget();renderCalls++;target->BeginDraw();draw(graphics);HRESULT hr=target->EndDraw();if(hr==D2DERR_RECREATE_TARGET){graphics.clear();target.reset();}else if(FAILED(hr))error="draw-failed";}catch(...){graphics.clear();target.reset();error="render-target-failed";}EndPaint(hwnd,&ps);}
+ void paint(){PAINTSTRUCT ps{};BeginPaint(hwnd,&ps);if(renderVisible)try{ensureTarget();renderCalls++;target->BeginDraw();draw(graphics);HRESULT hr=target->EndDraw();if(hr==static_cast<HRESULT>(D2DERR_RECREATE_TARGET)){graphics.clear();target.reset();}else if(FAILED(hr))error="draw-failed";}catch(...){graphics.clear();target.reset();error="render-target-failed";}EndPaint(hwnd,&ps);}
  void capture(){
   if(capturePath.empty())return;try{
    Com<IWICBitmap> bitmap;check(imaging->CreateBitmap(UINT(width*scale()),UINT(height*scale()),GUID_WICPixelFormat32bppPBGRA,WICBitmapCacheOnLoad,bitmap.put()));
@@ -506,28 +576,41 @@ class App {
   SetTimer(hwnd,3,3500,nullptr);
   command("seek",target);
  }
+ void stopCoverWorker(){
+  if(coverQueue){
+   {std::lock_guard<std::mutex> lock(coverQueue->mutex);coverQueue->stop=true;}
+   coverQueue->cancelActiveRequest();
+   coverQueue->changed.notify_one();
+  }
+  if(coverWorker.joinable())coverWorker.join();
+ }
  void startCoverWorker(){
+  stopCoverWorker();
   coverQueue=std::make_shared<CoverQueue>();auto queue=coverQueue;HWND window=hwnd;
-  std::thread([queue,window]{for(;;){std::wstring url;uint64_t epoch;
-   {std::unique_lock<std::mutex> lock(queue->mutex);queue->changed.wait(lock,[&]{return queue->stop||queue->pending;});if(queue->stop)return;url=queue->url;epoch=queue->epoch;queue->pending=false;}
-   std::unique_ptr<CoverData> result;bool superseded=false;
-   for(int attempt=0;attempt<3;attempt++){
-    result=downloadCover(url,epoch);
-    std::unique_lock<std::mutex> lock(queue->mutex);
-    if(queue->stop)return;if(queue->epoch!=epoch){superseded=true;break;}
-    if(!result->pixels.empty()||url.empty()||attempt==2)break;
-    // Retry the same request, but wake immediately when a new cover or shutdown arrives.
-    queue->changed.wait_for(lock,std::chrono::milliseconds(attempt==0?1000:3000),[&]{return queue->stop||queue->epoch!=epoch;});
-    if(queue->stop)return;if(queue->epoch!=epoch){superseded=true;break;}
+  coverWorker=std::thread([queue,window]{
+   CoverDownloader downloader;
+   for(;;){std::wstring url;uint64_t epoch;
+    {std::unique_lock<std::mutex> lock(queue->mutex);queue->changed.wait(lock,[&]{return queue->stop||queue->pending;});if(queue->stop)return;url=queue->url;epoch=queue->epoch;queue->pending=false;}
+    std::unique_ptr<CoverData> result;bool superseded=false;
+    for(int attempt=0;attempt<3;attempt++){
+     result=downloader.fetch(url,epoch,queue.get());
+     std::unique_lock<std::mutex> lock(queue->mutex);
+     if(queue->stop)return;if(queue->epoch!=epoch){superseded=true;break;}
+     if(!result->pixels.empty()||url.empty()||attempt==2)break;
+     // Retry the same request, but wake immediately when a new cover or shutdown arrives.
+     queue->changed.wait_for(lock,std::chrono::milliseconds(attempt==0?1000:3000),[&]{return queue->stop||queue->epoch!=epoch;});
+     if(queue->stop)return;if(queue->epoch!=epoch){superseded=true;break;}
+    }
+    if(superseded)continue;
+    if(PostMessageW(window,CoverReady,0,reinterpret_cast<LPARAM>(result.get())))result.release();
    }
-   if(superseded)continue;
-   if(PostMessageW(window,CoverReady,0,reinterpret_cast<LPARAM>(result.get())))result.release();
-  }}).detach();
+  });
  }
  void loadCover(const std::wstring&url){coverUrl=url;uint64_t epoch=++coverEpoch;if(!coverQueue)return;
+  coverQueue->cancelActiveRequest();
   {std::lock_guard<std::mutex> lock(coverQueue->mutex);coverQueue->url=url;coverQueue->epoch=epoch;coverQueue->pending=true;}coverQueue->changed.notify_one();
  }
- void onCover(std::unique_ptr<CoverData> data){if(data->epoch!=coverEpoch||closing)return;cover=std::move(*data);fluid.setCover(cover.pixels,cover.width,cover.height,backgroundClock.time(animationWall()),!backgroundPlaying());coverSince=nowMs();if(!cover.pixels.empty()){uint64_t r=0,g=0,b=0;for(size_t i=0;i<cover.pixels.size();i+=4){b+=cover.pixels[i];g+=cover.pixels[i+1];r+=cover.pixels[i+2];}float count=float(cover.pixels.size()/4);bgA=D2D1::ColorF((r/count*.3f+15)/255,(g/count*.3f+15)/255,(b/count*.3f+22)/255);bgB=D2D1::ColorF(std::min(100/255.f,bgA.r+24/255.f),std::min(100/255.f,bgA.g+17/255.f),std::min(120/255.f,bgA.b+30/255.f));}if(graphics.target){try{graphics.updateCover(cover);graphics.updateGradient(bgA,bgB,width,height);}catch(...){graphics.clear();}}update();}
+ void onCover(std::unique_ptr<CoverData> data){if(data->epoch!=coverEpoch||closing)return;cover=std::move(*data);fluid.setCover(cover.pixels,cover.width,cover.height,backgroundClock.time(animationWall()),!backgroundPlaying());coverSince=cover.pixels.empty()?-1000:nowMs();if(!cover.pixels.empty()){uint64_t r=0,g=0,b=0;for(size_t i=0;i<cover.pixels.size();i+=4){b+=cover.pixels[i];g+=cover.pixels[i+1];r+=cover.pixels[i+2];}float count=float(cover.pixels.size()/4);bgA=D2D1::ColorF((r/count*.3f+15)/255,(g/count*.3f+15)/255,(b/count*.3f+22)/255);bgB=D2D1::ColorF(std::min(100/255.f,bgA.r+24/255.f),std::min(100/255.f,bgA.g+17/255.f),std::min(120/255.f,bgA.b+30/255.f));}if(graphics.target){try{graphics.updateCover(cover);graphics.updateGradient(bgA,bgB,width,height);}catch(...){graphics.clear();}}update();}
  void freezeConnection(){
   if(connectionStale)return;
   position=current();anchor=nowMs();playing=false;connectionStale=true;
@@ -535,15 +618,18 @@ class App {
  }
  void receive(const Json&m){
   received=nowMs();auto type=m["type"].s();
-  if(type=="track"){auto id=m["id"].s();if(id!=songId){flight=LyricFlight();stopBrowsing();songId=id;groups.clear();focusIndex=-999;layoutDirty=true;snapRow=true;cancelSeek();seekRequest=0;lines.clear();lyricsReceived=false;untimed=false;hasClock=false;updatePlaceholders();index=-999;position=0;revision=0;valid=false;error.clear();}title=widen(m["title"].s());artist=widen(m["artist"].s());duration=std::max(0.,m["duration"].n());rebuildMeta();auto cover=widen(m["cover"].s());if(cover!=coverUrl)loadCover(cover);update();}
+  if(type=="ping"){if(connectionStale||error=="disconnected"){connectionStale=false;if(error=="disconnected")error.clear();update();}}
+  else if(type=="track"){auto id=m["id"].s();if(id!=songId){flight=LyricFlight();stopBrowsing();songId=id;groups.clear();focusIndex=-999;layoutDirty=true;snapRow=true;cancelSeek();seekRequest=0;lines.clear();lyricsReceived=false;untimed=false;hasClock=false;updatePlaceholders();index=-999;position=0;revision=0;valid=false;error.clear();}title=widen(m["title"].s());artist=widen(m["artist"].s());duration=std::max(0.,m["duration"].n());rebuildMeta();auto cover=widen(m["cover"].s());if(cover!=coverUrl)loadCover(cover);update();}
   else if(type=="lyrics"){
    if(m["songId"].s()!=songId){error="song-mismatch";report("lyrics-ack",false);return;}
    std::vector<Line> next;for(const auto&raw:m["lines"].array){if(next.size()>=5000)break;if(raw.kind!=Json::Object)continue;Line line;line.time=std::max(0.,raw["time"].n());line.duration=std::max(0.,raw["duration"].n());line.text=widen(raw["text"].s());line.isInterlude=raw["isInterlude"].b();line.translation=widen(raw["translation"].s());for(const auto&w:raw["words"].array){if(line.words.size()>=500)break;if(w.kind!=Json::Object)continue;line.words.push_back({widen(w["text"].s()),w["time"].n(),std::max(1.,w["duration"].n(1))});}if(line.text.empty())for(const auto&w:line.words)line.text+=w.text;next.push_back(std::move(line));}
-   bool nextUntimed=m["mode"].s()=="untimed";lyricsReceived=true;
+   bool nextUntimed=m["mode"].s()=="untimed",wasReceived=lyricsReceived;lyricsReceived=true;
    if(!nextUntimed)std::stable_sort(next.begin(),next.end(),[](const Line&a,const Line&b){return a.time<b.time;});
-   if(next!=lines||nextUntimed!=untimed){if(nextUntimed!=untimed){stopBrowsing();focusIndex=-999;snapRow=true;}untimed=nextUntimed;bool same=index>=0&&index<int(lines.size())&&index<int(next.size())&&lines[index].time==next[index].time&&lines[index].text==next[index].text;
-    flight=LyricFlight();lines=std::move(next);layoutDirty=true;if(!same)snapRow=true;updatePlaceholders();}
-   updatePlaceholders();revision=m["revision"].n();error.clear();update();report("lyrics-ack");
+   bool contentChanged=next!=lines||nextUntimed!=untimed;
+   if(contentChanged){if(nextUntimed!=untimed){stopBrowsing();focusIndex=-999;snapRow=true;}untimed=nextUntimed;bool same=index>=0&&index<int(lines.size())&&index<int(next.size())&&lines[index].time==next[index].time&&lines[index].text==next[index].text;
+    flight=LyricFlight();lines=std::move(next);layoutDirty=true;if(!same)snapRow=true;}
+   if(contentChanged||!wasReceived)updatePlaceholders();
+   revision=m["revision"].n();error.clear();update();report("lyrics-ack");
   }else if(type=="seek"){
    if(m["songId"].s()!=songId||m["position"].kind!=Json::Number||!std::isfinite(m["position"].n())||m["position"].n()<0)return;
    auto request=uint64_t(m["requestId"].n());if(request&&request!=seekRequest)return;
@@ -557,8 +643,9 @@ class App {
    bool animate=!untimed&&valid&&m["valid"].b()&&seekState!="failed"&&seekState!="pending"&&(changed||seekState=="confirmed");
    connectionStale=false;if(error=="disconnected")error.clear();
    playing=m["playing"].b();offset=m["offset"].n();if(m["duration"].n()>0)duration=m["duration"].n();
+   bool becomeValid=!valid&&m["valid"].b();
    // Retain the displayed geometry before accepting the new playback anchor.
-   if(animate)seekTo(incoming);else{if(valid&&changed&&flight.rows.empty())snapRow=true;position=incoming;anchor=nowMs();}
+   if(animate)seekTo(incoming);else{if((becomeValid||(valid&&changed))&&flight.rows.empty())snapRow=true;position=incoming;anchor=nowMs();}
    valid=m["valid"].b();update();report("host-state");}
   else if(type=="style"){int curve=int(clamp(m["curve"].n(),0,3));bool wave=m["stagger"].b(true);if(curve!=lineCurve||wave!=stagger){lineCurve=curve;stagger=wave;layoutDirty=true;update();}}
   else if(type=="font"){if(m["size"].kind==Json::Number)setLyricFontSize(m["size"].n());report("host-state");}
@@ -586,28 +673,60 @@ class App {
  void setTop(bool value){if(setWindowTopmost(hwnd,value,through))top=value;else error="topmost-change-failed";}
  void setThrough(bool value){through=value;LONG_PTR style=GetWindowLongPtrW(hwnd,GWL_EXSTYLE);if(value)style|=WS_EX_TRANSPARENT|WS_EX_LAYERED;else style&=~(WS_EX_TRANSPARENT|WS_EX_LAYERED);SetWindowLongPtrW(hwnd,GWL_EXSTYLE,style);if(!applyWindowActivationMode(hwnd,top,through))error="activation-mode-failed";if(value)SetLayeredWindowAttributes(hwnd,0,255,LWA_ALPHA);hover=false;}
  void constrain(){RECT rect{};GetWindowRect(hwnd,&rect);if(!MonitorFromRect(&rect,MONITOR_DEFAULTTONULL))SetWindowPos(hwnd,nullptr,int(80*scale()),int(80*scale()),0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);}
- void save(){if(!hwnd)return;RECT rect{};GetWindowRect(hwnd,&rect);Json j=Json::obj();j["X"]=int(rect.left);j["Y"]=int(rect.top);j["PositionInPixels"]=true;j["Width"]=(rect.right-rect.left)/scale();j["Height"]=(rect.bottom-rect.top)/scale();j["Top"]=top;j["Translation"]=translation;j["Fps"]=fps;j["FontSize"]=currentFontSize;j["Background"]=backgroundState();try{auto path=std::filesystem::path(settingsPath);std::filesystem::create_directories(path.parent_path());std::ofstream file(path,std::ios::binary);file<<j.dump();}catch(...){}}
+ void save(){
+  if(!hwnd)return;
+  recordNormalBounds();
+  RECT rect{};float rectScale=scale();
+  if(!IsIconic(hwnd)){if(!GetWindowRect(hwnd,&rect))return;}
+  else if(hasNormalRect){rect=normalWindowRect;rectScale=normalWindowScale;}
+  else{float s=positionInPixels?1.f:rectScale;rect={int(std::lround(savedX*s)),int(std::lround(savedY*s)),0,0};rect.right=rect.left+int(std::lround(savedWidth*rectScale));rect.bottom=rect.top+int(std::lround(savedHeight*rectScale));}
+  Json j=Json::obj();j["X"]=int(rect.left);j["Y"]=int(rect.top);j["PositionInPixels"]=true;j["Width"]=(rect.right-rect.left)/rectScale;j["Height"]=(rect.bottom-rect.top)/rectScale;j["Top"]=top;j["Translation"]=translation;j["Fps"]=fps;j["FontSize"]=currentFontSize;j["Background"]=backgroundState();
+  try{
+   auto path=std::filesystem::path(settingsPath);std::filesystem::create_directories(path.parent_path());
+   auto tmp=path;tmp+=L".tmp."+std::to_wstring(GetCurrentProcessId());
+   std::string payload=j.dump();bool wrote=false;
+   {std::ofstream file(tmp,std::ios::binary|std::ios::trunc);if(file){file.write(payload.data(),std::streamsize(payload.size()));wrote=bool(file.flush());}}
+   if(!wrote||!MoveFileExW(tmp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING)){
+    std::error_code ec;std::filesystem::remove(tmp,ec);
+    std::ofstream file(path,std::ios::binary|std::ios::trunc);file.write(payload.data(),std::streamsize(payload.size()));
+   }
+  }catch(...){}
+ }
  void menu(POINT point){HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING|(translation?MF_CHECKED:0),1,L"显示翻译");AppendMenuW(menu,MF_STRING|(top?MF_CHECKED:0),2,L"置顶");AppendMenuW(menu,MF_STRING|(through?MF_CHECKED:0),3,L"鼠标穿透（在插件设置中恢复）");AppendMenuW(menu,MF_STRING|(fps==30?MF_CHECKED:0),4,L"30 FPS");AppendMenuW(menu,MF_STRING|(fps==60?MF_CHECKED:0),5,L"60 FPS");AppendMenuW(menu,MF_STRING,6,L"关闭小窗");SetForegroundWindow(hwnd);int choice=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,hwnd,nullptr);DestroyMenu(menu);if(choice==1){translation=!translation;layoutDirty=true;}else if(choice==2)setTop(!top);else if(choice==3)setThrough(!through);else if(choice==4)fps=30;else if(choice==5)fps=60;else if(choice==6){DestroyWindow(hwnd);return;}save();update();}
  LRESULT message(UINT msg,WPARAM wp,LPARAM lp){
   switch(msg){
-   case WM_CREATE:{auto getWindowDpi=reinterpret_cast<UINT(WINAPI*)(HWND)>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"GetDpiForWindow"));if(getWindowDpi){UINT value=getWindowDpi(hwnd);if(value)dpi=float(value);}return 0;}
+   case WM_CREATE:{auto getWindowDpi=reinterpret_cast<UINT(WINAPI*)(HWND)>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"GetDpiForWindow")));if(getWindowDpi){UINT value=getWindowDpi(hwnd);if(value)dpi=float(value);}return 0;}
    case WM_PAINT:paint();return 0;case WM_ERASEBKGND:return 1;case WM_MOUSEACTIVATE:return windowMouseActivate(top,through);
    case Incoming:{std::unique_ptr<Json> value(reinterpret_cast<Json*>(lp));if(!closing)receive(*value);return 0;}
    case BridgeDisconnected:if(!closing&&bridge&&!bridge->connected())freezeConnection();return 0;
    case CoverReady:{std::unique_ptr<CoverData> value(reinterpret_cast<CoverData*>(lp));onCover(std::move(value));return 0;}
    case FrameReady:if(systemMoving&&modalFrames.accepts(wp)&&frameArmed&&nowMs()+1>=frameDeadline){frameArmed=false;update();if(renderVisible)UpdateWindow(hwnd);}return 0;
-   case WM_GETMINMAXINFO:{auto*limits=reinterpret_cast<MINMAXINFO*>(lp);limits->ptMinTrackSize.y=LONG(std::ceil(MinWindowHeight*scale()));return 0;}
+   case WM_GETMINMAXINFO:{auto*limits=reinterpret_cast<MINMAXINFO*>(lp);limits->ptMinTrackSize.x=LONG(std::ceil(360.f*scale()));limits->ptMinTrackSize.y=LONG(std::ceil(MinWindowHeight*scale()));return 0;}
    case WM_WINDOWPOSCHANGED:{auto result=DefWindowProcW(hwnd,msg,wp,lp);setRenderVisible(IsWindowVisible(hwnd)&&!IsIconic(hwnd));return result;}
    case WM_SIZE:if(wp==SIZE_MINIMIZED){setRenderVisible(false);return 0;}if(wp!=SIZE_MAXHIDE&&wp!=SIZE_MAXSHOW&&factory&&textFactory&&hwnd&&geometry()){update();if(resizing&&renderVisible)UpdateWindow(hwnd);}return 0;
-   case WM_DPICHANGED:{dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi,dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
+   case WM_DPICHANGED:{dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi,dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
    case WM_TIMER:if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}return 0;
    case WM_MOUSEWHEEL:{
     if(through||dragProgress||resizing||lines.empty())return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/scale(),y=p.y/scale();
     if(x<textX||x>width-12||y<viewportTop||y>viewportBottom)return 0;
     wheelRemainder+=GET_WHEEL_DELTA_WPARAM(wp);int steps=wheelRemainder/WHEEL_DELTA;wheelRemainder%=WHEEL_DELTA;if(!steps)return 0;
-    int next=browseStep(browseIndex>=0?browseIndex:index,steps);if(next<0)return 0;flight=LyricFlight();browseIndex=next;manualTransition=manualLayoutPending=true;browseUntil=animationWall()+4000;if(!untimed)SetTimer(hwnd,4,4000,nullptr);layoutDirty=true;update();return 0;
+    int origin=browseIndex>=0?browseIndex:(untimed&&focusIndex>=0?focusIndex:index);
+    int next=browseStep(origin,steps);if(next<0)return 0;flight=LyricFlight();browseIndex=next;manualTransition=manualLayoutPending=true;browseUntil=animationWall()+4000;if(!untimed)SetTimer(hwnd,4,4000,nullptr);layoutDirty=true;update();return 0;
    }
-   case WM_MOUSEMOVE:{float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();if(resizing){POINT point;GetCursorPos(&point);int w=int(clamp(resizeSize.cx+point.x-resizeStart.x,360*scale(),900*scale())),h=int(clamp(resizeSize.cy+point.y-resizeStart.y,MinWindowHeight*scale(),240*scale()));if(w!=geometryPixels.cx||h!=geometryPixels.cy)SetWindowPos(hwnd,nullptr,0,0,w,h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);}else if(dragProgress){dragRatio=transport.ratio(x);update();}else if(!hover&&!through){hover=true;TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,hwnd,0};TrackMouseEvent(&event);update();}return 0;}
+   case WM_SETCURSOR:{
+    if(LOWORD(lp)==HTCLIENT&&!through){
+     POINT pt{};GetCursorPos(&pt);ScreenToClient(hwnd,&pt);float x=pt.x/scale(),y=pt.y/scale();LPCWSTR id=IDC_ARROW;
+     if(x>width-17&&y>height-17)id=IDC_SIZENWSE;
+     else if((hover&&y<32&&x>width-78)||(hover&&y>=transport.y-14&&transport.hit(x,y)!=ControlHit::None))id=IDC_HAND;
+     else if(!untimed&&y>=viewportTop&&y<=viewportBottom&&x>=textX&&x<=width-12){
+      double now=motionNow();
+      for(const auto&item:groups){if(!groupVisible(item.second,now))continue;float top=item.second.y.value(now);if(y>=top-2&&y<=top+item.second.renderedHeight(item.second.zoom.value(now))){id=IDC_HAND;break;}}
+     }
+     SetCursor(LoadCursorW(nullptr,id));return TRUE;
+    }
+    break;
+   }
+   case WM_MOUSEMOVE:{float x=GET_X_LPARAM(lp)/scale();if(resizing){POINT point;GetCursorPos(&point);int w=int(clamp(resizeSize.cx+point.x-resizeStart.x,360*scale(),900*scale())),h=int(clamp(resizeSize.cy+point.y-resizeStart.y,MinWindowHeight*scale(),240*scale()));if(w!=geometryPixels.cx||h!=geometryPixels.cy)SetWindowPos(hwnd,nullptr,0,0,w,h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);}else if(dragProgress){dragRatio=transport.ratio(x);update();}else if(!hover&&!through){hover=true;TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,hwnd,0};TrackMouseEvent(&event);update();}return 0;}
    case WM_MOUSELEAVE:if(!dragProgress&&!resizing){hover=false;update();}return 0;
    case WM_LBUTTONDOWN:{if(through)return 0;float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();if(x>width-17&&y>height-17){resizing=true;GetCursorPos(&resizeStart);RECT r;GetWindowRect(hwnd,&r);resizeSize={r.right-r.left,r.bottom-r.top};SetCapture(hwnd);update();return 0;}if(hover&&y<32&&x>width-78){int i=int((x-(width-78))/24);if(i==0){setTop(!top);save();update();}else if(i==1){setThrough(true);update();}else DestroyWindow(hwnd);return 0;}
     if(hover&&y>=transport.y-14){
@@ -623,13 +742,14 @@ class App {
    case WM_CAPTURECHANGED:{bool sized=resizing;dragProgress=false;resizing=false;POINT p;GetCursorPos(&p);ScreenToClient(hwnd,&p);hover=!through&&p.x>=0&&p.y>=0&&p.x<width*scale()&&p.y<height*scale();update();if(sized)save();return 0;}
    case WM_CONTEXTMENU:{POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};if(p.x==-1)GetCursorPos(&p);menu(p);return 0;}
    case WM_ENTERSIZEMOVE:stopFrames();if(frameTimer)WaitForSingleObject(frameTimer,0);systemMoving=true;modalFrames.start(hwnd,frameTimer,FrameReady);update();return 0;
-   case WM_EXITSIZEMOVE:systemMoving=false;stopFrames();modalFrames.stop();update();save();return 0;
+   case WM_EXITSIZEMOVE:systemMoving=false;stopFrames();modalFrames.stop();recordNormalBounds();update();save();return 0;
    case WM_CLOSE:DestroyWindow(hwnd);return 0;
-   case WM_DESTROY:try{if(bridge)bridge->finish();}catch(...){}closing=true;systemMoving=false;stopFrames();modalFrames.stop();save();KillTimer(hwnd,1);KillTimer(hwnd,2);KillTimer(hwnd,3);KillTimer(hwnd,4);if(coverQueue){{std::lock_guard<std::mutex> lock(coverQueue->mutex);coverQueue->stop=true;}coverQueue->changed.notify_one();}PostQuitMessage(0);return 0;
+   case WM_DESTROY:try{if(bridge)bridge->finish();}catch(...){}closing=true;systemMoving=false;stopFrames();modalFrames.stop();save();KillTimer(hwnd,1);KillTimer(hwnd,2);KillTimer(hwnd,3);KillTimer(hwnd,4);stopCoverWorker();PostQuitMessage(0);return 0;
   }return DefWindowProcW(hwnd,msg,wp,lp);
  }
  static LRESULT CALLBACK procedure(HWND window,UINT msg,WPARAM wp,LPARAM lp){App*app=reinterpret_cast<App*>(GetWindowLongPtrW(window,GWLP_USERDATA));if(msg==WM_NCCREATE){app=static_cast<App*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);app->hwnd=window;SetWindowLongPtrW(window,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(app));}if(app){try{return app->message(msg,wp,lp);}catch(...){app->error="window-message-failed";}}return DefWindowProcW(window,msg,wp,lp);}
  public:
+ ~App(){stopCoverWorker();}
  App(){settingsPath=env(L"MINILYRICS_SETTINGS");if(settingsPath.empty())settingsPath=env(L"LOCALAPPDATA")+L"\\MiniLyrics\\settings.json";
   try{std::ifstream f(std::filesystem::path(settingsPath),std::ios::binary);std::string bytes((std::istreambuf_iterator<char>(f)),{});if(bytes.size()>65536)throw std::runtime_error("settings size");auto settings=JsonParser(bytes).parse();savedX=settings["X"].n(80);savedY=settings["Y"].n(80);positionInPixels=settings["PositionInPixels"].b();savedWidth=clamp(settings["Width"].n(360),360,900);savedHeight=clamp(settings["Height"].n(130),MinWindowHeight,240);top=settings["Top"].b(true);translation=settings["Translation"].b(true);fps=settings["Fps"].n(60)==60?60:30;readBackground(settings["Background"]);currentFontSize=float(std::round(clamp(settings["FontSize"].n(::CurrentFontSize),14,36)));contextFontSize=::ContextFontSize*currentFontSize/::CurrentFontSize;translationFontSize=::TranslationFontSize*currentFontSize/::CurrentFontSize;}catch(...){}
  }
@@ -639,7 +759,7 @@ class App {
   check(factory->CreatePathGeometry(playGeometry.put()));Com<ID2D1GeometrySink> sink;check(playGeometry->Open(sink.put()));sink->BeginFigure(D2D1::Point2F(-5,-7),D2D1_FIGURE_BEGIN_FILLED);sink->AddLine(D2D1::Point2F(-5,7));sink->AddLine(D2D1::Point2F(6,0));sink->EndFigure(D2D1_FIGURE_END_CLOSED);check(sink->Close());
   frameTimer=CreateWaitableTimerExW(nullptr,nullptr,0x00000002,TIMER_MODIFY_STATE|SYNCHRONIZE);if(!frameTimer)frameTimer=CreateWaitableTimerW(nullptr,FALSE,nullptr);
   WNDCLASSEXW cls{};cls.cbSize=sizeof(cls);cls.style=CS_DBLCLKS;cls.lpfnWndProc=procedure;cls.hInstance=instance;cls.hCursor=LoadCursorW(nullptr,IDC_ARROW);cls.lpszClassName=L"MiniLyrics.Direct2D";RegisterClassExW(&cls);
-  auto getSystemDpi=reinterpret_cast<UINT(WINAPI*)()>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"GetDpiForSystem"));if(getSystemDpi)dpi=float(getSystemDpi());
+  auto getSystemDpi=reinterpret_cast<UINT(WINAPI*)()>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"GetDpiForSystem")));if(getSystemDpi)dpi=float(getSystemDpi());
   float positionScale=positionInPixels?1.f:scale();
   hwnd=CreateWindowExW(WS_EX_TOOLWINDOW|(top?WS_EX_TOPMOST|WS_EX_NOACTIVATE:0),cls.lpszClassName,L"MiniLyrics",WS_POPUP,int(std::round(savedX*positionScale)),int(std::round(savedY*positionScale)),int(std::round(savedWidth*scale())),int(std::round(savedHeight*scale())),nullptr,nullptr,instance,this);if(!hwnd)throw std::runtime_error("window creation failed");
   // WM_CREATE has the actual monitor DPI. Correct the initial physical size
@@ -659,7 +779,7 @@ class App {
 };
 
 int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,LPWSTR,int){
- auto awareness=reinterpret_cast<BOOL(WINAPI*)(HANDLE)>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"SetProcessDpiAwarenessContext"));if(awareness)awareness(reinterpret_cast<HANDLE>(-4));else SetProcessDPIAware();
+ auto awareness=reinterpret_cast<BOOL(WINAPI*)(HANDLE)>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"SetProcessDpiAwarenessContext")));if(awareness)awareness(reinterpret_cast<HANDLE>(-4));else SetProcessDPIAware();
  HRESULT com=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);WSADATA wsa{};if(WSAStartup(MAKEWORD(2,2),&wsa)!=0)return 2;
  int result=1;try{int argc=0;LPWSTR*argv=CommandLineToArgvW(GetCommandLineW(),&argc);int port=0;std::string token;std::wstring capture;bool demo=false;for(int i=1;i<argc;i++){std::wstring arg=argv[i];if(arg==L"--demo")demo=true;else if(i+1<argc&&arg==L"--port")port=_wtoi(argv[++i]);else if(i+1<argc&&arg==L"--token")token=narrow(argv[++i]);else if(i+1<argc&&arg==L"--capture")capture=argv[++i];}LocalFree(argv);if(!demo&&(port<1024||port>65535||token.size()<32))result=2;else{App app;result=app.run(instance,port,token,capture,demo);}}
  catch(const std::exception&error){try{std::ofstream f(std::filesystem::path(env(L"TEMP")+L"\\MiniLyrics-error.log"),std::ios::binary);f<<error.what();}catch(...){}result=1;}

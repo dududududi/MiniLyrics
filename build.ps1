@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 $taskRoot = $PSScriptRoot
 if (!$SkipNativeBuild) {
  $compiler=Get-Command g++.exe -ErrorAction Stop
- $argsList=@('-std=c++17','-Os','-s','-static','-municode','-mwindows','-DUNICODE','-D_UNICODE',
+ $argsList=@('-std=c++17','-Os','-s','-static','-municode','-mwindows','-Wall','-Wextra','-Wno-misleading-indentation','-ffunction-sections','-fdata-sections','-Wl,--gc-sections','-DUNICODE','-D_UNICODE',
   (Join-Path $taskRoot 'native/Host.cpp'),'-o',(Join-Path $taskRoot 'MiniLyricsHost.exe'),
   '-ld3d11','-ld3dcompiler','-ldxgi','-ld2d1','-ldwrite','-lwindowscodecs','-lwinhttp','-lws2_32','-lbcrypt','-lcrypt32','-lole32','-luuid','-lshell32','-lgdi32')
  & $compiler.Source $argsList

@@ -20,8 +20,28 @@ struct Json {
  std::string s(const std::string& fallback="")const{return kind==String?text:fallback;}
  double n(double fallback=0)const{return kind==Number&&std::isfinite(number)?number:fallback;}
  bool b(bool fallback=false)const{return kind==Bool?boolean:fallback;}
- static std::string quote(const std::string&s){std::string out="\"";char hex[7];for(unsigned char c:s){switch(c){case '"':out+="\\\"";break;case '\\':out+="\\\\";break;case '\n':out+="\\n";break;case '\r':out+="\\r";break;case '\t':out+="\\t";break;default:if(c<32){std::snprintf(hex,sizeof(hex),"\\u%04x",c);out+=hex;}else out+=char(c);}}return out+'"';}
- std::string dump()const {switch(kind){case Null:return "null";case Bool:return boolean?"true":"false";case Number:{char b[40];std::snprintf(b,sizeof(b),"%.15g",number);return b;}case String:return quote(text);case Array:{std::string s="[";for(auto&v:array){if(s.size()>1)s+=',';s+=v.dump();}return s+']';}case Object:{std::string s="{";for(auto&v:object){if(s.size()>1)s+=',';s+=quote(v.first)+':'+v.second.dump();}return s+'}';}}return "null";}
+ static void appendQuoted(std::string&out,const std::string&s){
+  out+='"';char hex[7];
+  for(unsigned char c:s){
+   switch(c){
+    case '"':out+="\\\"";break;case '\\':out+="\\\\";break;case '\n':out+="\\n";break;case '\r':out+="\\r";break;case '\t':out+="\\t";break;
+    default:if(c<32){std::snprintf(hex,sizeof(hex),"\\u%04x",c);out+=hex;}else out+=char(c);
+   }
+  }
+  out+='"';
+ }
+ static std::string quote(const std::string&s){std::string out;out.reserve(s.size()+2);appendQuoted(out,s);return out;}
+ void dumpTo(std::string&out)const{
+  switch(kind){
+   case Null:out+="null";break;
+   case Bool:out+=(boolean?"true":"false");break;
+   case Number:{char b[40];int n=std::snprintf(b,sizeof(b),"%.15g",number);if(n>0)out.append(b,size_t(n));break;}
+   case String:appendQuoted(out,text);break;
+   case Array:{out+='[';for(size_t i=0;i<array.size();i++){if(i)out+=',';array[i].dumpTo(out);}out+=']';break;}
+   case Object:{out+='{';bool first=true;for(const auto&v:object){if(!first)out+=',';first=false;appendQuoted(out,v.first);out+=':';v.second.dumpTo(out);}out+='}';break;}
+  }
+ }
+ std::string dump()const{std::string out;dumpTo(out);return out;}
 };
 class JsonParser {
  const std::string&s;size_t p=0;

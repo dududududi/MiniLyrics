@@ -59,3 +59,42 @@ test('resetting progress also withdraws an established playback inference',()=>{
  const s=require('../core.js').createPlaybackState();s.sample(0,0,'Paused');s.sample(500,500,'Paused');assert.equal(s.sample(1000,1000,'Paused'),true);
  s.resetProgress();assert.equal(s.sample(50000,1100,'Paused',true),false);
 });
+test('renamed webpack exports, throwing module getters, non-array artists, and require caching',()=>{
+ const state={playing:{resourceTrackId:'r-1',onlineResourceId:99,resourceName:'Track',resourceArtists:{bad:true},resourceCoverUrl:'',curTrack:{duration:12000},playingState:1,playId:'p'}};
+ const store={getState:()=>state,subscribe:()=>()=>{},dispatch:()=>{}};
+ const nativeBridge={appendRegisterCall:()=>{},removeRegisterCall:()=>{},_Adapter:{registerCallMap:{}}};
+ const badModule={};Object.defineProperty(badModule,'exports',{get(){throw Error('boom');}});
+ const req={c:{
+  bad:badModule,
+  renamedStore:{exports:{c:{app:{_store:store}}}},
+  renamedStorage:{exports:{d:{lastPlaying:{get:async()=>null}}}},
+  bridge:{exports:{Bridge:nativeBridge}}
+ }};
+ const chunks=[[]];let pushes=0;
+ chunks.push=entry=>{pushes++;Object.values(entry[1])[0]({}, {}, req);};
+ const timers=new Map();let nextId=0;
+ const env={webpackJsonp:chunks,console,setTimeout:fn=>{timers.set(++nextId,fn);return nextId;},clearTimeout:id=>timers.delete(id)};
+ const api=createPlayerAdapter(env);
+ try{
+  assert.equal(api.ready,true);assert.equal(api.getCurrentSong().authorName,'');assert.equal(pushes,1);
+ }finally{api.dispose();}
+
+ // When webpackRequire is captured before store is ready, retries reuse cached require without pushing new chunks.
+ let storeReady=false;
+ const delayedReq={c:{
+  get s(){return storeReady?{exports:{c:{app:{_store:store}}}}:{exports:{}};},
+  bridge:{exports:{Bridge:nativeBridge}}
+ }};
+ const dChunks=[[]];let dPushes=0;dChunks.push=entry=>{dPushes++;Object.values(entry[1])[0]({}, {}, delayedReq);};
+ const dTimers=new Map();let dId=0;
+ const dEnv={webpackJsonp:dChunks,console,setTimeout:fn=>{dTimers.set(++dId,fn);return dId;},clearTimeout:id=>dTimers.delete(id)};
+ const dApi=createPlayerAdapter(dEnv);
+ try{
+  assert.equal(dApi.ready,false);assert.equal(dPushes,1);
+  for(const fn of [...dTimers.values()]){dTimers.clear();fn();}
+  assert.equal(dPushes,1,'retry must reuse cached require instead of pushing another chunk');
+  storeReady=true;
+  for(const fn of [...dTimers.values()]){dTimers.clear();fn();}
+  assert.equal(dApi.ready,true);assert.equal(dPushes,1);
+ }finally{dApi.dispose();}
+});

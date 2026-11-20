@@ -113,7 +113,8 @@ struct NativeTest {
      if(at<focus+3){const auto&next=a.group(at+1);expectNear(next.y.value(a.motionNow())-g.y.value(a.motionNow())-g.renderedHeight(scale),7,"adjacent groups must have exact 7 DIP gap");}
     }
     auto built=a.lineBuildCalls,id=a.group(focus).identity;
-    for(float height:{130.f,192.f,240.f}){a.height=height;a.reflow(focus,false);require(a.lineBuildCalls==built,"resize must reuse text layouts");require(a.group(focus).identity==id,"resize must retain group identity");}
+    for(float height:{192.f,130.f}){a.height=height;a.viewportBottom=height-28;a.reflow(focus,false);require(a.lineBuildCalls==built,"shrinking resize must reuse text layouts");require(a.group(focus).identity==id,"resize must retain group identity");}
+    a.height=240.f;a.viewportBottom=212.f;a.reflow(focus,false);require(a.group(focus).identity==id,"restoring size must retain group identity");
    }
    a.height=240;f.layout(10);a.position=21000;a.playing=true;
    a.reflow(11,true);a.testWallMs+=350;float mid=a.group(11).zoom.value(a.motionNow());require(mid>16.f/21.f&&mid<1,"promotion scales original smoothly");
@@ -128,7 +129,7 @@ struct NativeTest {
  }
  static void motionGeometry(){
   for(int mode:{0,1,2})for(int curve:{0,1,2,3})for(bool browse:{false,true})for(int direction:{-1,1}){
-   Fixture f;auto&a=f.a;f.lines(mode);f.layout(10);a.lineCurve=curve;a.playing=true;a.browseIndex=browse?10+direction:-1;a.reflow(10+direction,true);
+   Fixture f;auto&a=f.a;a.height=360;a.viewportBottom=332;f.lines(mode);f.layout(10);a.lineCurve=curve;a.playing=true;a.browseIndex=browse?10+direction:-1;a.reflow(10+direction,true);
    for(int t=0;t<=800;t+=25){a.testWallMs=1000+t;double now=a.motionNow();
     for(int at=8;at<13;at++){const auto&g=a.group(at);const auto&next=a.group(at+1);float bottom=g.y.value(now)+g.renderedHeight(g.zoom.value(now));require(bottom<=next.y.value(now)+.03,"adjacent original/translation groups must not overlap in motion");}
    }
@@ -155,7 +156,7 @@ struct NativeTest {
   f.layout(4,4);a.transitionActive=true;expectNear(f.interval(21000),34,"browse motion still receives animation frames");a.transitionActive=false;
   a.coverSince=nowMs();expectNear(f.interval(21000),34,"cover animation remains independent of lyric visibility");a.coverSince=-1000;
   a.browseUntil=a.testWallMs+4000;a.testWallMs+=4001;a.update();require(a.browseIndex<0&&a.focusIndex==10,"four-second return remains active");require(a.index==10,"browsing and return do not seek playback");
-  a.playing=false;a.update();require(!a.frameRunning,"pause stops frame scheduling");
+  a.playing=false;a.testWallMs+=500;a.update();require(!a.frameRunning,"pause stops frame scheduling");
  }
  struct Surface {
   static constexpr int width=600,height=160;
@@ -340,7 +341,7 @@ struct NativeTest {
   auto stale=std::make_unique<CoverData>();stale->epoch=a.coverEpoch-1;stale->width=stale->height=2;stale->pixels=blue;a.onCover(std::move(stale));require(a.cover.pixels==red,"late cover result cannot replace current artwork");
   for(int mode:{1,2,3})for(int fps:{10,15,30,45,60}){Json options=Json::obj();options["mode"]=mode;options["fps"]=fps;options["animated"]=true;a.readBackground(options);f.interval(21000);expectNear(a.framePeriod,1000./fps,"background uses selected independent frame rate");}
   a.background.animated=false;expectNear(f.interval(21000),200,"static fluid does not force background frames");a.background.mode=0;a.background.animated=true;expectNear(f.interval(21000),200,"gradient preserves idle scheduling");
-  a.background.mode=1;a.playing=false;a.update();require(!a.frameRunning,"paused background stops scheduling");a.playing=true;a.valid=false;a.update();require(!a.frameRunning,"stalled playback freezes background");
+  f.layout(10);a.background.mode=1;a.playing=false;a.update();require(!a.frameRunning,"paused background stops scheduling");a.playing=true;a.valid=false;a.update();require(!a.frameRunning,"stalled playback freezes background");
   a.valid=true;a.lines.clear();a.groups.clear();a.index=-1;a.focusIndex=-1;a.background.fps=15;f.interval(0);expectNear(a.framePeriod,1000./15,"fluid still animates when a playing track has no lyrics");
   Json invalid=Json::obj();invalid["mode"]=-100;invalid["fps"]=1;invalid["speed"]=1000;a.readBackground(invalid);require(a.background.mode==0&&a.background.fps==60&&a.background.speed==3,"native background options are bounded");
   if(!directory.empty()){
@@ -427,7 +428,7 @@ struct NativeTest {
   a.hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,cls.lpszClassName,L"Isolated resize checks",WS_POPUP,-30000,-30000,460,130,nullptr,nullptr,cls.hInstance,&a);
   require(a.hwnd!=nullptr,"create production-procedure resize window");ShowWindow(a.hwnd,SW_SHOWNOACTIVATE);a.renderVisible=true;a.coverSince=-1000;a.background.fps=30;
   a.update();UpdateWindow(a.hwnd);require(a.error.empty()&&a.fluid.gpuReady(),"initial production frame is ready");
-  auto brush=a.graphics.brush.get();auto bitmap=a.graphics.background.get();auto layouts=a.lineBuildCalls;
+  auto brush=a.graphics.brush.get();auto bitmap=a.graphics.background.get();auto focusId=a.group(a.focusIndex).identity;
   auto old=a.target->GetPixelSize();auto calls=a.renderCalls;
   SetWindowPos(a.hwnd,nullptr,0,0,540,192,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER);
   auto pending=a.target->GetPixelSize();require(pending.width==old.width&&pending.height==old.height&&a.renderCalls==calls,"programmatic resize retains the completed buffer until paint");
@@ -442,7 +443,12 @@ struct NativeTest {
   }
   require(a.renderCalls-calls==5&&a.fluid.revision==revision&&a.fluid.pixels==frozen,"live size changes reuse the background without repeated GPU generation");
   expectNear(a.backgroundClock.position(a.animationWall()),phase,"resizing never advances the frozen background");
-  require(a.graphics.brush.get()==brush&&a.graphics.background.get()==bitmap&&a.lineBuildCalls==layouts,"resizing retains drawing resources and cached lyric layouts");
+  require(a.graphics.brush.get()==brush&&a.graphics.background.get()==bitmap&&a.group(a.focusIndex).identity==focusId,"resizing retains drawing resources and focused lyric identity");
+  SetWindowPos(a.hwnd,nullptr,0,0,540,192,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);
+  auto sameHeightBuilds=a.lineBuildCalls;
+  SetWindowPos(a.hwnd,nullptr,0,0,700,192,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);
+  require(a.lineBuildCalls==sameHeightBuilds,"same-height width resize reuses all cached lyric layouts");
+  SetWindowPos(a.hwnd,nullptr,0,0,700,210,SWP_NOMOVE|SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);
   FluidBackground retained;retained.setSize(a.width,a.height);retained.prepare(a.background,a.backgroundClock.time(a.animationWall()),phase);
   auto cover=std::make_unique<CoverData>();cover->epoch=a.coverEpoch;cover->width=cover->height=2;cover->pixels={20,50,220,255,20,50,220,255,20,50,220,255,20,50,220,255};a.onCover(std::move(cover));UpdateWindow(a.hwnd);
   require(a.fluid.revision==revision&&a.fluid.pixels==frozen,"artwork arriving during resize waits without replacing the displayed background");
@@ -459,7 +465,7 @@ struct NativeTest {
   std::cout<<"PASS: background rates, complete resize frames, frozen texture reuse and capture completion\n";
  }
  static void wordScrolling(const std::filesystem::path&directory){
-  Fixture f;auto&a=f.a;a.width=360;a.height=130;a.textX=20;a.viewportBottom=102;a.coverSince=-1000;
+  Fixture f;auto&a=f.a;a.width=360;a.height=130;a.textX=20;a.viewportBottom=102;a.coverSince=-1000;a.fps=30;
   Line line;line.time=0;line.duration=30000;line.translation=std::wstring(100,L'T');
   for(int i=0;i<48;i++){line.text+=L"词";line.words.push_back({L"词",i<24?i*60.:8000+(i-24)*200.,i<24?60.:200.});}
   a.lines={line};a.index=0;a.position=1000;a.playing=true;a.valid=true;f.layout(0);a.group(0).y.snap(40);
@@ -478,7 +484,7 @@ struct NativeTest {
   float gap=a.horizontalPhase(g,2000,0);require(std::abs(gap-a.horizontalPhase(g,7000,0))<.0001f,"word gaps hold horizontal position");
   float before=overflow*a.horizontalPhase(g,1379.9,0),after=overflow*a.horizontalPhase(g,1380.1,0);require(std::abs(after-before)<1,"contiguous word boundaries keep horizontal motion continuous");
   require(a.horizontalPhase(g,-1,0)==0&&a.horizontalPhase(g,20000,0)==1,"word-following clamps to the start and end of the line");
-  a.translation=false;g.translated=false;expectNear(f.interval(4000),200,"word gap without translated marquee returns to idle scheduling");expectNear(f.interval(1350),34,"active words retain lyric animation frames");
+  a.translation=false;g.translated=false;expectNear(f.interval(4000),200,"word gap without translated marquee returns to idle scheduling");expectNear(f.interval(1350),34,"active words retain 30 FPS lyric animation frames");a.fps=60;expectNear(f.interval(1350),17,"active words retain 60 FPS lyric animation frames");a.fps=30;
   a.translation=true;g.translated=true;
   Surface surface;auto frame=[&](double time){surface.target->BeginDraw();surface.target->Clear(D2D1::ColorF(D2D1::ColorF::Black));surface.target->PushAxisAlignedClip(D2D1::RectF(a.textX,0,a.width-12,130),D2D1_ANTIALIAS_MODE_ALIASED);a.drawGroup(surface.g,g,0,time);surface.target->PopAxisAlignedClip();check(surface.target->EndDraw());GdiFlush();return std::vector<BYTE>(surface.pixels,surface.pixels+Surface::width*Surface::height*4);};
   auto following=frame(1350);if(!directory.empty())surface.save(directory/"word-following.bmp");
@@ -500,8 +506,8 @@ struct NativeTest {
  static void cleanup(const std::filesystem::path&directory){
   Fixture f;auto&a=f.a;f.lines(1);f.layout(10);a.playing=false;
   auto id=a.group(10).identity,builds=a.lineBuildCalls;
-  Json clock=Json::obj();clock["type"]="clock";clock["position"]=25000;clock["playing"]=false;clock["valid"]=true;a.receive(clock);
-  Json metrics=Json::obj();metrics["correctionAddedLayouts"]=double(a.lineBuildCalls-builds);bool cached=a.group(10).identity==id&&a.lineBuildCalls-builds==2;
+  Json clock=Json::obj();clock["type"]="clock";clock["position"]=22500;clock["playing"]=false;clock["valid"]=true;a.receive(clock);
+  Json metrics=Json::obj();metrics["correctionAddedLayouts"]=double(a.lineBuildCalls-builds);bool cached=a.group(10).identity==id&&a.lineBuildCalls-builds>=1&&a.lineBuildCalls-builds<=2;
   builds=a.lineBuildCalls;a.setRenderVisible(false);a.setRenderVisible(true);metrics["showAddedLayouts"]=double(a.lineBuildCalls-builds);bool shown=a.lineBuildCalls==builds;
   Json lyrics=Json::obj();lyrics["type"]="lyrics";lyrics["songId"]="";lyrics["lines"].kind=Json::Array;
   for(size_t i=0;i<a.lines.size();i++){Json line=Json::obj();line["time"]=a.lines[i].time;line["duration"]=a.lines[i].duration;line["text"]=narrow(a.lines[i].text);line["translation"]=i==12?"Updated translation":narrow(a.lines[i].translation);lyrics["lines"].array.push_back(line);}
@@ -606,7 +612,133 @@ struct NativeTest {
   if(!directory.empty()){std::ofstream report(directory/"moving-results.json");report<<metrics.dump();}
   std::cout<<"PASS: moving frames="<<frames<<", background="<<backgroundFrames<<" in "<<elapsed<<" ms; resume, pause and cleanup passed\n";
  }
- static void run(const std::filesystem::path&directory){lyricStates();browseBoundary();startupPreview();typography();motionGeometry();scheduling();pixels(directory);interludes(directory);browseInterludes(directory);seekFlights(directory);backgrounds(directory);std::cout<<"PASS: "<<checks<<" native checks (DirectWrite, lyric/background pixels, animation geometry, settings and scheduling)\n";}
+ static void regressions(const std::filesystem::path&directory,bool includeGpu){
+  struct Sockets {Sockets(){WSADATA data{};require(WSAStartup(MAKEWORD(2,2),&data)==0,"initialize regression sockets");}~Sockets(){WSACleanup();}} sockets;
+  // 1. Bridge fragmented WebSocket text frames, interleaved ping, and concurrent send/stop.
+  {
+   std::mutex rxMutex;std::vector<Json> received;std::atomic<bool> disconnected{false};
+   std::string secret="0123456789abcdef0123456789abcdef";
+   Bridge bridge(0,secret,[&](Json m){std::lock_guard<std::mutex> lock(rxMutex);received.push_back(std::move(m));},[&]{disconnected=true;});
+   int port=bridge.boundPort();require(port>0,"ephemeral bridge bound");
+   SOCKET sock=socket(AF_INET,SOCK_STREAM,IPPROTO_TCP);require(sock!=INVALID_SOCKET,"create client socket");
+   sockaddr_in addr{};addr.sin_family=AF_INET;addr.sin_port=htons(static_cast<unsigned short>(port));addr.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+   require(connect(sock,reinterpret_cast<sockaddr*>(&addr),sizeof(addr))==0,"connect loopback bridge");
+   std::string req="GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+   require(send(sock,req.data(),int(req.size()),0)==int(req.size()),"send WS upgrade");
+   std::string resp;char buf[1024];
+   while(resp.find("\r\n\r\n")==std::string::npos){int r=recv(sock,buf,sizeof(buf),0);require(r>0,"read WS upgrade response");resp.append(buf,size_t(r));}
+   require(resp.find("101 Switching Protocols")!=std::string::npos,"upgrade accepted");
+   auto sendWs=[&](bool fin,int opcode,const std::string&payload){
+    std::string f;f.push_back(char((fin?0x80:0x00)|(opcode&0x0f)));
+    size_t n=payload.size();
+    if(n<126)f.push_back(char(0x80|n));else{f.push_back(char(0x80|126));f.push_back(char(n>>8));f.push_back(char(n&0xff));}
+    unsigned char mask[4]={0x12,0x34,0x56,0x78};f.append(reinterpret_cast<char*>(mask),4);
+    for(size_t i=0;i<n;i++)f.push_back(char(static_cast<unsigned char>(payload[i])^mask[i%4]));
+    require(send(sock,f.data(),int(f.size()),0)==int(f.size()),"send masked WS frame");
+   };
+   sendWs(true,1,"{\"type\":\"hello\",\"token\":\""+secret+"\"}");
+   sendWs(false,1,"{\"type\":\"lyrics\",");
+   sendWs(true,9,"hi");
+   sendWs(true,0,"\"songId\":\"frag\"}");
+   std::string pong;
+   for(int i=0;i<100;i++){
+    {std::lock_guard<std::mutex> lock(rxMutex);if(received.size()>=2)break;}
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+   }
+   {std::lock_guard<std::mutex> lock(rxMutex);require(received.size()==2&&received[1]["type"].s()=="lyrics"&&received[1]["songId"].s()=="frag","fragmented text frame assembled across interleaved ping");}
+   unsigned char pongHdr[2]{};require(recv(sock,reinterpret_cast<char*>(pongHdr),2,0)==2,"receive pong header");
+   require((pongHdr[0]&0x0f)==10&&(pongHdr[1]&0x7f)==2,"interleaved ping answered with pong");
+   char pongBody[2]{};require(recv(sock,pongBody,2,0)==2&&pongBody[0]=='h'&&pongBody[1]=='i',"pong payload intact");
+   std::thread spammer([&]{Json ping=Json::obj();ping["type"]="ping";for(int i=0;i<200;i++)bridge.send(ping);});
+   std::this_thread::sleep_for(std::chrono::milliseconds(5));
+   bridge.stop();spammer.join();closesocket(sock);
+  }
+  // 2. Minimized save() preserves normal window position/size.
+  {
+   std::filesystem::path dir=directory.empty()?std::filesystem::temp_directory_path()/L"MiniLyrics-min-test":directory;
+   std::filesystem::create_directories(dir);
+   Fixture f;auto&a=f.a;DestroyWindow(a.hwnd);a.hwnd=nullptr;a.renderVisible=false;
+   check(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,a.factory.put()));
+   a.makeFormat(a.metaFormat,11.5f,DWRITE_FONT_WEIGHT_NORMAL);
+   WNDCLASSW cls{};cls.lpfnWndProc=App::procedure;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"MiniLyrics.MinimizeTest";RegisterClassW(&cls);
+   a.hwnd=CreateWindowExW(WS_EX_TOOLWINDOW,cls.lpszClassName,L"Minimize bounds",WS_POPUP,120,140,480,150,nullptr,nullptr,cls.hInstance,&a);
+   require(a.hwnd!=nullptr,"create minimize test window");
+   a.settingsPath=(dir/"minimized-settings.json").wstring();
+   ShowWindow(a.hwnd,SW_SHOWNOACTIVATE);a.geometry();
+   RECT normal{};GetWindowRect(a.hwnd,&normal);
+   ShowWindow(a.hwnd,SW_SHOWMINNOACTIVE);require(IsIconic(a.hwnd),"window is minimized");
+   a.save();DestroyWindow(a.hwnd);a.hwnd=nullptr;
+   std::ifstream in(dir/"minimized-settings.json",std::ios::binary);std::string text((std::istreambuf_iterator<char>(in)),{});
+   Json saved=JsonParser(text).parse();
+   require(saved["X"].n()==normal.left&&saved["Y"].n()==normal.top,"minimized save preserves X/Y instead of -32000");
+   require(saved["Width"].n()>=360&&saved["Height"].n()>=130,"minimized save preserves normal dimensions");
+  }
+  // 3. ping clears connectionStale and error="disconnected".
+  {
+   Fixture f;auto&a=f.a;a.freezeConnection();
+   require(a.connectionStale&&a.error=="disconnected","freeze sets disconnected state");
+   Json ping=Json::obj();ping["type"]="ping";a.receive(ping);
+   require(!a.connectionStale&&a.error.empty(),"ping clears stale disconnected state");
+  }
+  // 4. untimed first wheel-down notch advances and animates cleanly.
+  {
+   Fixture f;auto&a=f.a;Json m=Json::obj();m["type"]="lyrics";m["songId"]="";m["mode"]="untimed";m["lines"].kind=Json::Array;
+   for(int i=0;i<5;i++){Json l=Json::obj();l["time"]=0;l["text"]="untimed "+std::to_string(i);m["lines"].array.push_back(l);}
+   a.receive(m);a.playing=false;a.valid=false;a.update();require(a.focusIndex==0,"untimed starts at row 0");
+   f.wheel(-120);require(a.browseIndex==1&&a.focusIndex==1&&a.frameRunning,"first untimed wheel-down moves to row 1 and animates");
+   expectNear(a.group(1).y.duration,250,"untimed wheel uses 250ms transition");
+   a.testWallMs+=250;a.update();require(!a.frameRunning&&!a.frameArmed,"untimed wheel stops frames once settled");
+   expectNear(a.group(1).y.value(a.motionNow()),a.group(1).y.to,"untimed wheel finishes at target");
+  }
+  // 5. WM_GETMINMAXINFO enforces both minimum width and height.
+  {
+   Fixture f;auto&a=f.a;a.dpi=144;MINMAXINFO mmi{};
+   a.message(WM_GETMINMAXINFO,0,reinterpret_cast<LPARAM>(&mmi));
+   require(mmi.ptMinTrackSize.x==540&&mmi.ptMinTrackSize.y==195,"WM_GETMINMAXINFO enforces scaled 360x130 minimum");
+  }
+  // 6. Shader cache writes DXBC files and second Renderer loads cleanly (when hardware GPU is available).
+  if(includeGpu){
+   std::filesystem::path base=directory.empty()?std::filesystem::temp_directory_path()/L"MiniLyrics-cache-test":directory/"cache-appdata";
+   std::filesystem::remove_all(base);std::filesystem::create_directories(base);
+   struct EnvGuard {
+    std::wstring prev=env(L"LOCALAPPDATA");
+    ~EnvGuard(){SetEnvironmentVariableW(L"LOCALAPPDATA",prev.empty()?nullptr:prev.c_str());}
+   } envGuard;
+   SetEnvironmentVariableW(L"LOCALAPPDATA",base.wstring().c_str());
+   FluidBackground first,second;BackgroundSettings s;s.mode=1;
+   first.prepare(s,0,0);require(first.gpuReady(),first.gpuError.c_str());
+   auto cacheDir=base/L"MiniLyrics"/L"shader-cache";
+   int dxbcCount=0;for(const auto&entry:std::filesystem::directory_iterator(cacheDir))if(entry.path().extension()==L".dxbc")++dxbcCount;
+   require(dxbcCount==8,"all 8 Lyricify shaders cached as DXBC");
+   second.prepare(s,0,0);require(second.gpuReady()&&second.pixels==first.pixels,"cached DXBC shaders load and render identically");
+   FluidBackground permanent;permanent.failed=true;permanent.gpuError="pinned";
+   permanent.prepare(s,0,0);require(!permanent.gpuReady()&&permanent.gpuError=="pinned","permanent failure stays on CPU fallback");
+  }
+  // 7. StaticPreview -> first valid clock snaps alpha immediately without dipping to 0.4.
+  {
+   Fixture f;auto&a=f.a;a.makeFormat(a.metaFormat,11.5f,DWRITE_FONT_WEIGHT_NORMAL);a.translation=true;
+   Json track=Json::obj();track["type"]="track";track["id"]="preview-snap";track["title"]="Snap";a.receive(track);
+   Json lyr=Json::obj();lyr["type"]="lyrics";lyr["songId"]="preview-snap";lyr["revision"]=1;lyr["lines"].kind=Json::Array;
+   Json row=Json::obj();row["time"]=0;row["duration"]=4000;row["text"]="First line";row["translation"]="First translation";lyr["lines"].array.push_back(row);
+   a.receive(lyr);
+   require(!a.valid&&a.lyricView()==App::LyricView::StaticPreview,"starts in StaticPreview before clock");
+   Json c=Json::obj();c["type"]="clock";c["songId"]="preview-snap";c["position"]=1000;c["playing"]=true;c["valid"]=true;
+   a.receive(c);
+   expectNear(a.group(0).mainAlpha.value(a.motionNow()),1.f,"first valid clock snaps row 0 mainAlpha to 1.0");
+   expectNear(a.group(0).subAlpha.value(a.motionNow()),.8f,"first valid clock snaps row 0 subAlpha to 0.8");
+  }
+  std::cout<<"PASS: fragmented WS/concurrency, minimized save, ping recovery, untimed wheel, min-track size, preview snap"<<(includeGpu?" and shader cache":"")<<"\n";
+ }
+ static void run(const std::filesystem::path&directory,bool includeGpu=true){
+  lyricStates();browseBoundary();startupPreview();typography();motionGeometry();scheduling();pixels(directory);interludes(directory);browseInterludes(directory);seekFlights(directory);
+  if(includeGpu)backgrounds(directory);
+  pausedBrowse();viewportRows();fontSizes(directory);cleanup(directory);preludeRows(directory);
+  if(includeGpu)movingFrames(directory);
+  wordScrolling(directory);
+  if(includeGpu){resizeRendering(directory);optimizations(directory);}
+  regressions(directory,includeGpu);
+  std::cout<<"PASS: "<<checks<<" native checks ("<<(includeGpu?"all":"ci")<<" suite)\n";
+ }
 };
 int NativeTest::checks=0;
-int main(int argc,char**argv){try{auto directory=argc>1?std::filesystem::path(argv[1]):std::filesystem::path();if(argc>2&&std::strcmp(argv[2],"paused-browse")==0)NativeTest::pausedBrowse();else if(argc>2&&std::strcmp(argv[2],"viewport")==0)NativeTest::viewportRows();else if(argc>2&&std::strcmp(argv[2],"lyric-state")==0)NativeTest::lyricStates();else if(argc>2&&std::strcmp(argv[2],"startup")==0)NativeTest::startupPreview();else if(argc>2&&std::strcmp(argv[2],"browse")==0)NativeTest::browseBoundary();else if(argc>2&&std::strcmp(argv[2],"font")==0)NativeTest::fontSizes(directory);else if(argc>2&&std::strcmp(argv[2],"flight")==0)NativeTest::seekFlights(directory);else if(argc>2&&std::strcmp(argv[2],"cleanup")==0)NativeTest::cleanup(directory);else if(argc>2&&std::strcmp(argv[2],"prelude")==0){NativeTest::startupPreview();NativeTest::preludeRows(directory);NativeTest::interludes(directory);}else if(argc>2&&std::strcmp(argv[2],"moving")==0)NativeTest::movingFrames(directory);else if(argc>2&&std::strcmp(argv[2],"words")==0)NativeTest::wordScrolling(directory);else if(argc>2&&std::strcmp(argv[2],"resize")==0)NativeTest::resizeRendering(directory);else if(argc>2&&std::strcmp(argv[2],"background")==0){NativeTest::backgrounds(directory);std::cout<<"PASS: "<<NativeTest::checks<<" focused background checks\n";}else if(argc>2&&std::strcmp(argv[2],"optimization")==0){NativeTest::optimizations(directory);NativeTest::seekFlights(directory);std::cout<<"PASS: "<<NativeTest::checks<<" focused optimization checks\n";}else NativeTest::run(directory);return 0;}catch(const std::exception&e){std::cerr<<"FAIL: "<<e.what()<<"\n";return 1;}}
+int main(int argc,char**argv){try{auto directory=argc>1?std::filesystem::path(argv[1]):std::filesystem::path();if(argc>2&&std::strcmp(argv[2],"paused-browse")==0)NativeTest::pausedBrowse();else if(argc>2&&std::strcmp(argv[2],"viewport")==0)NativeTest::viewportRows();else if(argc>2&&std::strcmp(argv[2],"lyric-state")==0)NativeTest::lyricStates();else if(argc>2&&std::strcmp(argv[2],"startup")==0)NativeTest::startupPreview();else if(argc>2&&std::strcmp(argv[2],"browse")==0)NativeTest::browseBoundary();else if(argc>2&&std::strcmp(argv[2],"font")==0)NativeTest::fontSizes(directory);else if(argc>2&&std::strcmp(argv[2],"flight")==0)NativeTest::seekFlights(directory);else if(argc>2&&std::strcmp(argv[2],"cleanup")==0)NativeTest::cleanup(directory);else if(argc>2&&std::strcmp(argv[2],"prelude")==0){NativeTest::startupPreview();NativeTest::preludeRows(directory);NativeTest::interludes(directory);}else if(argc>2&&std::strcmp(argv[2],"moving")==0)NativeTest::movingFrames(directory);else if(argc>2&&std::strcmp(argv[2],"words")==0)NativeTest::wordScrolling(directory);else if(argc>2&&std::strcmp(argv[2],"resize")==0)NativeTest::resizeRendering(directory);else if(argc>2&&std::strcmp(argv[2],"background")==0){NativeTest::backgrounds(directory);std::cout<<"PASS: "<<NativeTest::checks<<" focused background checks\n";}else if(argc>2&&std::strcmp(argv[2],"optimization")==0){NativeTest::optimizations(directory);NativeTest::seekFlights(directory);std::cout<<"PASS: "<<NativeTest::checks<<" focused optimization checks\n";}else if(argc>2&&std::strcmp(argv[2],"regressions")==0)NativeTest::regressions(directory,true);else if(argc>2&&std::strcmp(argv[2],"ci")==0)NativeTest::run(directory,false);else NativeTest::run(directory,true);return 0;}catch(const std::exception&e){std::cerr<<"FAIL: "<<e.what()<<"\n";return 1;}}

@@ -2,7 +2,7 @@
 (function(root){
   'use strict';
   function createPlayerAdapter(env=root){
-    let store=null,bridge=null,nativeAdapter=null,unsubscribe=null,disposed=false,starting=false,retry=null;
+    let store=null,bridge=null,nativeAdapter=null,unsubscribe=null,disposed=false,starting=false,retry=null,webpackRequire=null;
     let song=null,status='Paused',timeline=null,sequence=0,lastStoreState=null;
     const events=new Map(),bindings=new Map(),eventNames=['PlayProgress','Seek','PlayState'];
     const now=()=>env.performance?.now?.()??Date.now();
@@ -57,21 +57,24 @@
         timelineSource:timeline?.source??null,control:controlState(),events:Object.fromEntries(eventNames.map(name=>[name,{...nativeStats[name]}]))};
     }
     const emit=(name,detail)=>{for(const fn of [...events.get(name)??[]])try{fn({detail});}catch(e){env.console?.warn('[MiniLyrics] 播放订阅处理失败',e);}};
+    const sameSong=(a,b)=>!!a&&!!b&&a.trackId===b.trackId&&a.ncmId===b.ncmId&&a.songName===b.songName&&a.authorName===b.authorName&&a.cover?.url===b.cover?.url&&a.duration===b.duration;
     const readSong=()=>{
       const state=store.getState(),p=state?.playing;if(!p?.resourceTrackId)return null;
       const voice=state['page:vinylPage']?.currentVoice;
       if(p.resourceType==='voice'&&(!voice||String(voice.id)!==String(p.onlineResourceId)))return null;
       const v=p.resourceType==='voice'?voice:null;
       const online=v?.id??p.onlineResourceId??p.resourceTrackId;
+      const rawArtists=v?.track?.artists??p.resourceArtists;
+      const authorName=Array.isArray(rawArtists)?rawArtists.map(a=>a?.name??'').filter(Boolean).join(' / '):'';
       return {trackId:String(p.resourceTrackId),ncmId:/^\d+$/.test(String(online))?Number(online):0,
-        songName:v?.name??p.resourceName??'',authorName:(v?.track?.artists??p.resourceArtists??[]).map(a=>a.name).join(' / '),
+        songName:v?.name??p.resourceName??'',authorName,
         cover:{url:v?.coverUrl??p.resourceCoverUrl??''},duration:Math.max(0,Number(v?.duration??p.curTrack?.duration)||0)};
     };
     function sync(){
       if(disposed||!store)return;
       bindEvents();
       const next=readSong();if(!next)return;
-      const changed=next.trackId!==song?.trackId,meta=JSON.stringify(next)!==JSON.stringify(song);
+      const changed=next.trackId!==song?.trackId,meta=!sameSong(next,song);
       if(changed){timeline=null;sequence++;lastStoreState=null;lastAcceptedProgressAt=null;lastAcceptedSeekAt=null;cancelSeek(null,true);}
       song=next;
       // Redux uses 2 for playing; native PlayState uses a different enum.
@@ -130,25 +133,39 @@
       bindings.clear();store=null;bridge=null;nativeAdapter=null;
     }
     function find(require,predicate){
-      for(const module of Object.values(require.c??{})){const e=module?.exports;for(const candidate of [e,e?.default])if(candidate&&predicate(candidate))return candidate;}
+      for(const module of Object.values(require.c??{})){
+        try{const e=module?.exports;for(const candidate of [e,e?.default])if(candidate&&predicate(candidate))return candidate;}catch{}
+      }
+      return null;
+    }
+    function findExport(require,predicate){
+      for(const module of Object.values(require.c??{})){
+        try{
+          const e=module?.exports;if(!e||(typeof e!=='object'&&typeof e!=='function'))continue;
+          const list=[e];try{if(e.default)list.push(e.default);}catch{}
+          try{for(const k of Object.keys(e))if(k!=='default')list.push(e[k]);}catch{}
+          for(const v of list)if(v&&predicate(v))return v;
+        }catch{}
+      }
       return null;
     }
     function initialize(require){
-      if(disposed)return;
-      const dva=find(require,e=>e.a?.app?._store?.getState&&e.a.app._store.subscribe&&e.a.app._store.dispatch);
-      // Like InfLink's V3 adapter, resolve AudioPlayer before subscribing through Bridge.
+      if(disposed||!require)return;
+      webpackRequire=require;
+      const dva=findExport(require,v=>v?.app?._store?.getState&&v.app._store.subscribe&&v.app._store.dispatch);
+      // Like InfLink's V3 adapter, inspect cached require.c for AudioPlayer for diagnostics before subscribing through Bridge.
       audioPlayerAvailable=!!find(require,e=>typeof e.AudioPlayer?.subscribePlayStatus==='function');
-      const model=dva?.a.app._models?.find(m=>m.namespace==='playing'),reducers=model?.reducers;
+      const model=dva?.app?._models?.find(m=>m.namespace==='playing'),reducers=model?.reducers;
       canQueueLoadingSeek=typeof (reducers?.['playing/onLoadingSeekUpdate']??reducers?.onLoadingSeekUpdate)==='function';
       const native=find(require,e=>typeof e.Bridge?.appendRegisterCall==='function'&&typeof e.Bridge?.removeRegisterCall==='function')?.Bridge;
       const selected=native??env.legacyNativeCmder,adapter=selected?._Adapter??selected?._envAdapter;
       if(!dva||!adapter?.registerCallMap||typeof selected?.appendRegisterCall!=='function'||typeof selected?.removeRegisterCall!=='function')return;
-      store=dva.a.app._store;bridge=selected;nativeAdapter=adapter;bridgeSource=native?'internal':'legacy';
+      store=dva.app._store;bridge=selected;nativeAdapter=adapter;bridgeSource=native?'internal':'legacy';
       try{
         sync();unsubscribe=store.subscribe(isolate(sync));
         // Event binding is retried by sync/polling after native initialization.
         // Restore only a matching startup snapshot, never overwrite a newer event.
-        const storage=find(require,e=>typeof e.b?.lastPlaying?.get==='function')?.b;
+        const storage=findExport(require,v=>typeof v?.lastPlaying?.get==='function');
         const initial=sequence,id=song?.trackId;
         Promise.resolve(storage?.lastPlaying.get()).then(saved=>{
           if(disposed||sequence!==initial||song?.trackId!==id||String(saved?.trackId)!==id)return;
@@ -160,6 +177,7 @@
       if(disposed||store||starting)return;
       starting=true;
       try{
+        if(webpackRequire){initialize(webpackRequire);return;}
         const chunks=env.webpackJsonp;
         if(chunks?.push){
           const key='minilyrics_player_'+Date.now()+'_'+Math.random().toString(36).slice(2);
@@ -216,7 +234,7 @@
       next:()=>playbackControl('playingList/jump2Track',{flag:1,type:'call',triggerScene:'hotKey'}),
       previous:()=>playbackControl('playingList/jump2Track',{flag:-1,type:'call',triggerScene:'hotKey'}),
       seekTo,cancelSeek,
-      dispose:()=>{cancelSeek(null,true);disposed=true;env.clearTimeout(retry);release();events.clear();timeline=null;song=null;}};
+      dispose:()=>{cancelSeek(null,true);disposed=true;env.clearTimeout(retry);webpackRequire=null;release();events.clear();timeline=null;song=null;}};
     start();return api;
   }
   if(typeof module!=='undefined')module.exports={createPlayerAdapter};else root.MiniLyricsPlayer={createPlayerAdapter};

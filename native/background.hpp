@@ -78,10 +78,10 @@ class FluidBackground {
  std::unique_ptr<lyricify::Renderer>gpu;
  ColorFieldFallback fallback;
  std::vector<uint8_t>current,previous;
- bool dirty=true,upload=true,failed=false;int lastMode=-1,lastFps=0;int64_t lastBucket=-1;
+ bool dirty=true,upload=true,failed=false;int lastMode=-1,lastFps=0,gpuRecoveries=0;int64_t lastBucket=-1;
  double transitionAt=-1000;float viewWidth=360,viewHeight=130;
  float blend(double elapsed)const{return float(std::max(0.,std::min(1.,(elapsed-transitionAt)/500)));}
- void defaultArtwork(const BackgroundPalette&p){current.resize(192*192*4);for(int y=0;y<192;y++)for(int x=0;x<192;x++){float u=x/191.f,v=y/191.f;int k=(y>=96?2:0)+(x>=96?1:0);auto a=p[k];size_t i=(y*192+x)*4;current[i]=uint8_t(a.b*255);current[i+1]=uint8_t(a.g*255);current[i+2]=uint8_t(a.r*255);current[i+3]=255;}previous=current;upload=true;}
+ void defaultArtwork(const BackgroundPalette&p){current.resize(192*192*4);for(int y=0;y<192;y++)for(int x=0;x<192;x++){int k=(y>=96?2:0)+(x>=96?1:0);auto a=p[k];size_t i=(y*192+x)*4;current[i]=uint8_t(a.b*255);current[i+1]=uint8_t(a.g*255);current[i+2]=uint8_t(a.r*255);current[i+3]=255;}previous=current;upload=true;}
  public:
  static constexpr unsigned width=192,height=72;
  std::vector<uint8_t>pixels;uint64_t revision=0;std::string gpuError;
@@ -98,12 +98,23 @@ class FluidBackground {
   transitionAt=immediate?elapsed-500:elapsed;if(immediate)previous=current;
   fallback.setPalette(coverBackgroundPalette(p,w,h));upload=true;invalidate();
  }
- bool prepare(const BackgroundSettings&s,double elapsed,double position){
+ bool prepare(const BackgroundSettings&s,double elapsed,double position,bool allowAsync=false){
   if(s.mode<=0||s.mode>3)return false;int64_t bucket=int64_t(std::floor((std::max(0.,elapsed)+.000001)*s.fps/1000));
   if(!dirty&&lastMode==s.mode&&lastFps==s.fps&&lastBucket==bucket)return false;
-  if(!failed)try{if(!gpu)gpu=std::make_unique<lyricify::Renderer>();if(upload){gpu->artwork(current,previous);upload=false;}gpu->draw(std::max(0.,position)/1000,blend(elapsed),s.mode,viewWidth,viewHeight,pixels);}
-  catch(const std::exception&e){failed=true;gpuError=e.what();gpu.reset();}
-  if(failed){fallback.prepare(s,elapsed,position);pixels=fallback.pixels;}
-  dirty=false;lastMode=s.mode;lastFps=s.fps;lastBucket=bucket;++revision;return true;
+  bool useAsync=allowAsync&&!dirty&&!upload&&lastMode==s.mode&&blend(elapsed)>=1.f&&!pixels.empty();
+  bool updated=true;
+  if(!failed){
+   auto renderWithGpu=[&](bool asyncMode){if(!gpu)gpu=std::make_unique<lyricify::Renderer>();if(upload){gpu->artwork(current,previous);upload=false;}return gpu->draw(std::max(0.,position)/1000,blend(elapsed),s.mode,viewWidth,viewHeight,pixels,asyncMode);};
+   try{updated=renderWithGpu(useAsync);}
+   catch(const lyricify::DeviceRemovedError&e){
+    gpu.reset();upload=true;
+    if(++gpuRecoveries<=3){try{updated=renderWithGpu(false);gpuError.clear();}catch(const std::exception&retryErr){failed=true;gpuError=retryErr.what();gpu.reset();}}
+    else{failed=true;gpuError=e.what();}
+   }catch(const std::exception&e){failed=true;gpuError=e.what();gpu.reset();}
+  }
+  if(failed){fallback.prepare(s,elapsed,position);pixels=fallback.pixels;updated=true;}
+  dirty=false;lastMode=s.mode;lastFps=s.fps;lastBucket=bucket;
+  if(!updated)return false;
+  ++revision;return true;
  }
 };

@@ -24,9 +24,16 @@ test('limits visual node data and tolerates null lyric input',()=>{
  assert.deepEqual(C.normalizeLines(null),[]);
  assert.equal(C.normalizeLines([{dynamicLyric:new Array(600).fill({word:'x',time:0})}])[0].words.length,500);
 });
-test('malformed provider entries do not break normalization or metadata',()=>{
+ test('malformed provider entries do not break normalization or metadata',()=>{
  const lines=C.normalizeLines([null,undefined,'bad',{time:0,text:'valid',dynamicLyric:[null,false,{time:0,word:'valid',duration:100}]}]);
  assert.equal(lines.length,1);assert.equal(lines[0].words.length,1);
  assert.equal(C.metadata(null),null);
  assert.equal(C.metadata({trackId:'a',authorName:'Artist'}).artist,'Artist');
+});
+test('wellFormed replaces lone UTF-16 surrogates while preserving valid emoji pairs',()=>{
+ assert.equal(C.wellFormed('hi\uD83D!\uDC00🎵'), 'hi\uFFFD!\uFFFD🎵');
+ const [line]=C.normalizeLines([{time:0,text:'bad\uD83Dline 🎵',translation:'tr\uDC00',dynamicLyric:[{word:'w\uD83D',time:0,duration:100}]}]);
+ assert.equal(line.text,'bad\uFFFDline 🎵');assert.equal(line.translation,'tr\uFFFD');assert.equal(line.words[0].text,'w\uFFFD');
+ const meta=C.metadata({trackId:'id\uD83D',songName:'Song 🎵\uDC00',authorName:'A\uD800'});
+ assert.equal(meta.id,'id\uFFFD');assert.equal(meta.title,'Song 🎵\uFFFD');assert.equal(meta.artist,'A\uFFFD');
 });
