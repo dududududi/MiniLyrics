@@ -92,9 +92,9 @@ struct NativeTest {
  static void lyricStates(){
   struct Sockets {Sockets(){WSADATA data{};require(WSAStartup(MAKEWORD(2,2),&data)==0,"initialize lyric-state bridge");}~Sockets(){WSACleanup();}} sockets;
   int failures=0;auto run=[&](const char*name,auto scenario){try{scenario();std::cout<<"PASS: "<<name<<"\n";}catch(const std::exception&e){failures++;std::cout<<"FAIL: "<<name<<": "<<e.what()<<"\n";}};
-  run("startup rows are visible and clickable",[]{Fixture f;auto&a=f.a;f.lines(1);for(auto&l:a.lines)l.time+=5000;a.valid=false;a.playing=false;a.position=0;a.index=-1;a.updatePlaceholders();a.update();auto&g=a.group(0);require(a.groupVisible(g,a.motionNow()),"preview must use normal row visibility");a.bridge=std::make_unique<Bridge>(0,std::string(32,'t'),[](Json){});a.message(WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(int(a.textX+8),int(g.y.value(a.motionNow())+g.mainHeight/2)));require(a.seekPending&&a.position==0,"preview click only requests a seek");});
+  run("startup rows are visible and clickable",[]{Fixture f;auto&a=f.a;f.lines(1);for(auto&l:a.lines)l.time+=5000;a.valid=false;a.playing=false;a.position=0;a.index=-1;a.updatePlaceholders();a.update();auto&g=a.group(0);require(a.groupVisible(g,a.motionNow()),"preview must use normal row visibility");a.bridge=std::make_unique<Bridge>(0,std::string(32,'t'),[](Json){});a.message(WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(int(a.textX+8),int(g.y.value(a.motionNow())+g.content->mainHeight/2)));require(a.seekPending&&a.position==0,"preview click only requests a seek");});
   run("stale progress retains a visible current row",[]{Fixture f;auto&a=f.a;f.lines();Json c=Json::obj();c["type"]="clock";c["position"]=21000;c["playing"]=true;c["valid"]=true;a.receive(c);c["valid"]=false;c["playing"]=false;a.receive(c);require(a.index==10&&a.focusIndex==10&&a.groupVisible(a.group(10),a.motionNow()),"lost clock must not return to first lyric");require(!a.frameRunning,"stale clock stops frames");});
-  run("untimed content stays browsable without time seeking",[]{Fixture f;auto&a=f.a;Json m=Json::obj();m["type"]="lyrics";m["songId"]="";m["mode"]="untimed";m["lines"].kind=Json::Array;for(int i=0;i<8;i++){Json l=Json::obj();l["time"]=0;l["text"]="text "+std::to_string(i);m["lines"].array.push_back(l);}a.receive(m);Json c=Json::obj();c["type"]="clock";c["position"]=21000;c["playing"]=true;c["valid"]=true;a.receive(c);require(a.focusIndex==0,"untimed rows must not follow timestamps");f.wheel(-360);int focus=a.focusIndex;a.testWallMs+=5000;a.update();require(a.focusIndex==focus,"untimed reading position does not auto-return");a.bridge=std::make_unique<Bridge>(0,std::string(32,'t'),[](Json){});auto&g=a.group(focus);a.message(WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(int(a.textX+8),int(g.y.value(a.motionNow())+g.mainHeight/2)));require(!a.seekPending,"untimed lyric click cannot seek");});
+  run("untimed content stays browsable without time seeking",[]{Fixture f;auto&a=f.a;Json m=Json::obj();m["type"]="lyrics";m["songId"]="";m["mode"]="untimed";m["lines"].kind=Json::Array;for(int i=0;i<8;i++){Json l=Json::obj();l["time"]=0;l["text"]="text "+std::to_string(i);m["lines"].array.push_back(l);}a.receive(m);Json c=Json::obj();c["type"]="clock";c["position"]=21000;c["playing"]=true;c["valid"]=true;a.receive(c);require(a.focusIndex==0,"untimed rows must not follow timestamps");f.wheel(-360);int focus=a.focusIndex;a.testWallMs+=5000;a.update();require(a.focusIndex==focus,"untimed reading position does not auto-return");a.bridge=std::make_unique<Bridge>(0,std::string(32,'t'),[](Json){});auto&g=a.group(focus);a.message(WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(int(a.textX+8),int(g.y.value(a.motionNow())+g.content->mainHeight/2)));require(!a.seekPending,"untimed lyric click cannot seek");});
   run("empty result is distinct from pending lyrics",[]{Fixture f;auto&a=f.a;require(a.state("test")["lyricStatus"].s()=="waiting","waiting before a result");Json m=Json::obj();m["type"]="lyrics";m["songId"]="";m["mode"]="empty";a.receive(m);require(a.state("test")["lyricStatus"].s()=="empty","empty result state");});
   run("mode changes reset reading focus and preserve native input order",[]{Fixture f;auto&a=f.a;f.lines();a.playing=true;a.update();Json m=Json::obj();m["type"]="lyrics";m["songId"]="";m["mode"]="untimed";m["lines"].kind=Json::Array;for(int i=0;i<3;i++){Json l=Json::obj();l["time"]=9000-i*1000;l["text"]="row "+std::to_string(i);m["lines"].array.push_back(l);}a.receive(m);require(a.focusIndex==0&&a.lines[0].text==L"row 0","timed to untimed starts at the input's first row");require(!a.frameRunning,"untimed lyrics do not schedule playback frames");f.wheel(-120);int focus=a.focusIndex;a.seekTo(40000);a.update();require(a.focusIndex==focus&&a.flight.rows.empty(),"transport seek preserves untimed reading");m["mode"]="timed";a.receive(m);require(a.lines[0].time==7000&&a.index==2,"timed mode resumes sorted clock selection");});
   require(failures==0,"lyric state scenarios failed");
@@ -107,8 +107,8 @@ struct NativeTest {
     for(int at=focus-3;at<=focus+3;at++){
      const auto&g=a.group(at);float scale=g.zoom.value(a.motionNow());
      expectNear(CurrentFontSize*scale,at==focus?21:16,"focus/context original font");
-     float expected=g.mainHeight*scale;
-     if(g.translated){FLOAT size=0;check(g.subtitle.value->GetFontSize(0,&size,nullptr));expectNear(size,16,"translation layout remains 16");expected+=(6.3f+g.subtitle.height)*scale;expectNear(g.subtitleOffset(scale)-g.mainHeight*scale,6.3*scale,"within-group gap follows group scale");}
+     float expected=g.content->mainHeight*scale;
+     if(g.translated){FLOAT size=0;check(g.content->subtitle.value->GetFontSize(0,&size,nullptr));expectNear(size,16,"translation layout remains 16");expected+=(6.3f+g.content->subtitle.height)*scale;expectNear(g.subtitleOffset(scale)-g.content->mainHeight*scale,6.3*scale,"within-group gap follows group scale");}
      expectNear(g.renderedHeight(scale),expected,"rendered group height includes scaled translation");
      if(at<focus+3){const auto&next=a.group(at+1);expectNear(next.y.value(a.motionNow())-g.y.value(a.motionNow())-g.renderedHeight(scale),7,"adjacent groups must have exact 7 DIP gap");}
     }
@@ -118,7 +118,7 @@ struct NativeTest {
    }
    a.height=240;f.layout(10);a.position=21000;a.playing=true;
    a.reflow(11,true);a.testWallMs+=350;float mid=a.group(11).zoom.value(a.motionNow());require(mid>16.f/21.f&&mid<1,"promotion scales original smoothly");
-   if(a.group(11).translated)expectNear(a.group(11).renderedHeight(mid)-a.group(11).mainHeight*mid,(6.3+a.group(11).subtitle.height)*mid,"translation scales during promotion");
+   if(a.group(11).translated)expectNear(a.group(11).renderedHeight(mid)-a.group(11).content->mainHeight*mid,(6.3+a.group(11).content->subtitle.height)*mid,"translation scales during promotion");
    double paused=a.motionNow();a.motion.setRunning(false,a.testWallMs);a.testWallMs+=1000;expectNear(a.motionNow(),paused,"pause freezes the size/position clock");
    require(a.groups.size()<=32,"bounded layout cache");
   }
@@ -180,7 +180,7 @@ struct NativeTest {
  static void startupPreview(){
   Fixture f;auto&a=f.a;f.lines(1);for(auto&line:a.lines)line.time+=5000;a.lines[0].text=L"Ready before playback";a.position=0;a.index=-1;a.valid=false;a.playing=false;a.updatePlaceholders();a.update();Surface surface;
   const auto frame=[&](bool expected){surface.target->BeginDraw();surface.target->Clear(D2D1::ColorF(D2D1::ColorF::Black));
-   if(expected){const auto&p=a.group(a.preludePreview);a.text(surface.g,p.main,a.textX,a.lyricAnchor(),D2D1::ColorF(D2D1::ColorF::White));a.text(surface.g,p.subtitle,a.textX,a.lyricAnchor()+p.mainHeight+TranslationGap,D2D1::ColorF(D2D1::ColorF::White),.8f);}
+   if(expected){const auto&p=a.group(a.preludePreview);a.text(surface.g,p.content->main,a.textX,a.lyricAnchor(),D2D1::ColorF(D2D1::ColorF::White));a.text(surface.g,p.content->subtitle,a.textX,a.lyricAnchor()+p.content->mainHeight+TranslationGap,D2D1::ColorF(D2D1::ColorF::White),.8f);}
    else a.drawLyrics(surface.g,0);
    check(surface.target->EndDraw());GdiFlush();return std::vector<BYTE>(surface.pixels,surface.pixels+Surface::width*Surface::height*4);};
   auto actual=frame(false),expected=frame(true);int top=int(a.lyricAnchor()),bottom=int(a.lyricAnchor()+a.group(0).renderedHeight(1));require(std::equal(actual.begin()+top*Surface::width*4,actual.begin()+bottom*Surface::width*4,expected.begin()+top*Surface::width*4),"paused startup displays first lyric and translation before a clock sample");
@@ -189,7 +189,7 @@ struct NativeTest {
   std::cout<<"PASS: startup lyric preview without fabricated playback\n";
  }
  static void pixels(const std::filesystem::path&directory){
-  Fixture f;auto&a=f.a;f.lines(1);f.layout(10,10);a.textX=20;auto&row=a.group(10);row.subtitle=a.layout(L"Translation scales with the lyric",a.secondaryFormat.get());Surface surface;
+  Fixture f;auto&a=f.a;f.lines(1);f.layout(10,10);a.textX=20;auto&row=a.group(10);row.content->subtitle=a.layout(L"Translation scales with the lyric",a.secondaryFormat.get());Surface surface;
   std::vector<BYTE> baseline;int baselineWidth=0,baselineHeight=0;
   for(float scale:{1.f,16.f/21.f}){
    row.zoom.snap(scale);row.y.snap(100-row.subtitleOffset(scale));
@@ -232,10 +232,10 @@ struct NativeTest {
   require(indicatorCrop(render())==prelude,"prelude and timed empty row render identical indicator pixels");
   if(!directory.empty())surface.save(directory/"unified-timed-gap.bmp");
   f.interval(1000);expectNear(a.framePeriod,1000./30,"timed gap has the same indicator frame rate");
-  auto early=indicatorCrop(render());a.position=5000;a.snapRow=true;a.update();auto late=indicatorCrop(render());require(late!=early,"seek changes actual dot pixels without restarting the fade");expectNear(a.group(0).dots.opacity.value(a.motionNow()),1,"seek within current interlude preserves container visibility");a.position=1000;a.snapRow=true;a.update();require(indicatorCrop(render())==early,"backward seek immediately restores dot progress");
+  auto early=indicatorCrop(render());a.position=5000;a.snapRow=true;a.update();auto late=indicatorCrop(render());require(late!=early,"seek changes actual dot pixels without restarting the fade");expectNear(a.group(0).dots.opacity.value(a.indicatorNow()),1,"seek within current interlude preserves container visibility");a.position=1000;a.snapRow=true;a.update();require(indicatorCrop(render())==early,"backward seek immediately restores dot progress");
   a.motion.setRunning(false,a.testWallMs);a.playing=false;a.updateIndicators();auto paused=render();a.testWallMs+=500;a.schedule();require(!a.frameRunning,"pause stops indicator timer");require(render()==paused,"paused indicator remains pixel-identical");
   a.motion.setRunning(true,a.testWallMs);a.playing=true;a.updateIndicators();a.testWallMs+=500;require(indicatorCrop(render())!=indicatorCrop(paused),"resumed indicator continues breathing");
-  f.layout(0,0);require(!a.showInterlude(a.group(0))&&!a.groupVisible(a.group(0),a.motionNow()),"browsed empty row has no indicator or hit target");f.interval(1000);expectNear(a.framePeriod,200,"browsed empty row does not force animation frames");
+  f.layout(0,0);require(a.showInterlude(a.group(0)),"browsing preserves the indicator for the current timed gap");
   a.valid=false;require(a.lyricView()==App::LyricView::Rows,"manual browse remains available while clock is unconfirmed");
   f.layout(0);require(a.lyricView()==App::LyricView::Rows,"stale progress retains rows after an earlier valid clock");require(a.groupVisible(a.group(1),a.motionNow())&&!a.showInterlude(a.group(0)),"unconfirmed progress shows text without a timed indicator");
   a.valid=true;a.index=0;f.layout(0);a.testWallMs+=1000;a.index=1;f.layout(1);require(a.indicatorVisible(a.group(0)),"ending interlude fades out for 500ms like RNP");a.testWallMs+=500;require(!a.groupVisible(a.group(0),a.motionNow()),"past empty row disappears when its fade completes");f.interval(6500);expectNear(a.framePeriod,200,"past empty row does not drive high frequency redraw after fade");
@@ -246,7 +246,7 @@ struct NativeTest {
   a.lines.erase(a.lines.begin());a.groups.clear();a.index=a.rowAt(-1000);a.position=0;a.offset=-1000;a.updatePlaceholders();require(a.lyricView()==App::LyricView::Prelude,"negative lyric offset uses the same prelude state");
   a.lines.clear();a.valid=false;a.updatePlaceholders();require(a.lyricView()==App::LyricView::Waiting,"missing lyrics remain a separate waiting state");
   Fixture wire;Json message=Json::obj(),raw=Json::obj();message["type"]="lyrics";message["songId"]="";message["lines"].kind=Json::Array;raw["time"]=0;raw["duration"]=6000;raw["text"]="Marked";raw["isInterlude"]=true;message["lines"].array.push_back(raw);wire.a.receive(message);
-  require(wire.a.lines[0].isInterlude&&wire.a.group(0).model.isInterlude,"native bridge preserves explicit RNP marker");message["lines"].array[0]["isInterlude"]=false;wire.a.receive(message);require(!wire.a.lines[0].isInterlude&&!wire.a.group(0).model.isInterlude,"marker-only change updates native cached row");
+  require(wire.a.lines[0].isInterlude&&wire.a.group(0).content->model.isInterlude,"native bridge preserves explicit RNP marker");message["lines"].array[0]["isInterlude"]=false;wire.a.receive(message);require(!wire.a.lines[0].isInterlude&&!wire.a.group(0).content->model.isInterlude,"marker-only change updates native cached row");
  }
  static void browseInterludes(const std::filesystem::path&directory){
   auto prepare=[](Fixture&f){auto&a=f.a;a.lines.clear();a.groups.clear();a.focusIndex=-999;
@@ -255,23 +255,23 @@ struct NativeTest {
   };
   Fixture f;prepare(f);auto&a=f.a;f.wheel(-120);require(a.browseIndex==2,"one wheel notch reaches the middle interlude placeholder");require(a.index==1&&a.position==1500,"browsing does not seek or change the playback row");
   for(int i=1;i<6;i++){const auto&g=a.group(i);const auto&next=a.group(i+1);expectNear(next.y.value(a.motionNow())-g.y.value(a.motionNow())-g.renderedHeight(g.zoom.value(a.motionNow())),7,"middle placeholders retain row height and exact 7 DIP gaps");}
-  require(a.staticInterlude(a.group(2))&&a.groupVisible(a.group(2),a.motionNow()),"focused middle interlude is a visible static placeholder");require(a.staticInterlude(a.group(3))&&a.groupVisible(a.group(3),a.motionNow()),"adjacent middle interlude also remains visible");require(!a.groupVisible(a.group(0),a.motionNow()),"leading interlude remains hidden during browse");
+  require(a.group(2).middleInterlude&&a.groupVisible(a.group(2),a.motionNow()),"focused middle interlude retains a blank hit target");require(a.group(3).middleInterlude&&a.groupVisible(a.group(3),a.motionNow()),"adjacent middle interlude also retains its row");require(!a.groupVisible(a.group(0),a.motionNow()),"inactive leading interlude remains hidden during browse");
   f.wheel(-120);require(a.browseIndex==3,"consecutive middle interludes retain separate placeholder rows");f.wheel(-120);require(a.browseIndex==4,"next notch reaches the following lyric");f.wheel(-240);require(a.browseIndex==6,"multi-notch wheel includes the middle placeholder");f.wheel(-120);require(a.browseIndex==6,"trailing interlude cannot become browse focus");
   f.wheel(120);require(a.browseIndex==5,"reverse wheel also reaches the middle placeholder");f.wheel(1200);require(a.browseIndex==1,"leading interludes remain outside browse bounds");
   f.wheel(-60);require(a.browseIndex==1,"partial wheel delta does not consume a row");f.wheel(-60);require(a.browseIndex==2,"accumulated partial deltas reach a middle placeholder");
-  a.lines[2].isInterlude=false;a.lines[2].text=L"New lyric";a.layoutDirty=true;a.update();require(a.browseIndex==2&&!a.staticInterlude(a.group(2)),"lyric update replaces placeholder content without moving browse focus");
-  a.lines[2].isInterlude=true;a.lines[2].text.clear();a.layoutDirty=true;a.update();require(a.browseIndex==2&&a.staticInterlude(a.group(2)),"lyric update can restore the middle placeholder in place");
+  a.lines[2].isInterlude=false;a.lines[2].text=L"New lyric";a.layoutDirty=true;a.update();require(a.browseIndex==2&&!a.group(2).middleInterlude,"lyric update replaces placeholder content without moving browse focus");
+  a.lines[2].isInterlude=true;a.lines[2].text.clear();a.layoutDirty=true;a.update();require(a.browseIndex==2&&a.group(2).middleInterlude,"lyric update can restore the middle placeholder in place");
   a.testWallMs+=4001;a.update();require(a.browseIndex<0&&a.index==1&&a.focusIndex==1,"four-second return restores original playback row");
-  for(int delta:{-120,120}){Fixture gap;prepare(gap);auto&g=gap.a;g.position=2500;g.index=g.rowAt(g.position);gap.layout(2);gap.wheel(delta);require(g.browseIndex==(delta<0?3:1),"browsing from current interlude moves one row including placeholders");g.testWallMs+=4001;g.update();require(g.browseIndex<0&&g.index==2&&g.focusIndex==2,"returning to playback retains the timed interlude");require(g.lines[2].time==2000&&g.rowAt(2500)==2,"browsing never removes an interlude timestamp");require(!g.staticInterlude(g.group(2)),"returning to playback removes static placeholder mode");}
+  for(int delta:{-120,120}){Fixture gap;prepare(gap);auto&g=gap.a;g.position=2500;g.index=g.rowAt(g.position);gap.layout(2);gap.wheel(delta);require(g.browseIndex==(delta<0?3:1),"browsing from current interlude moves one row including placeholders");g.testWallMs+=4001;g.update();require(g.browseIndex<0&&g.index==2&&g.focusIndex==2,"returning to playback retains the timed interlude");require(g.lines[2].time==2000&&g.rowAt(2500)==2,"browsing never removes an interlude timestamp");require(g.indicatorVisible(g.group(2)),"returning to playback keeps the current interlude visible");}
   for(int delta:{-120,120}){Fixture intro;auto&g=intro.a;Line first;first.time=5000;first.text=L"First";Line second;second.time=8000;second.text=L"Second";g.lines={first,second};g.index=-1;g.valid=true;intro.layout(0);intro.wheel(delta);require(g.browseIndex==0,"first wheel gesture before lyrics reaches first real lyric");}
   Fixture empty;auto&e=empty.a;Line blank;blank.isInterlude=true;blank.duration=1000;e.lines={blank,blank};e.lines[1].time=1000;e.valid=true;e.index=0;empty.layout(0);empty.wheel(-120);require(e.browseIndex<0,"all-interlude data does not enter an invisible browse mode");
   Fixture single;auto&s=single.a;Line only;only.time=1000;only.text=L"Only lyric";s.lines={blank,only,blank};s.lines[2].time=2000;s.valid=true;s.index=0;single.layout(0);single.wheel(-120);require(s.browseIndex==1,"single real lyric can be reached through leading blanks");single.wheel(120);single.wheel(-120);require(s.browseIndex==1,"single real lyric remains the boundary in both directions");
   Fixture visual;prepare(visual);auto&v=visual.a;visual.wheel(-120);v.height=160;v.viewportBottom=132;v.textX=20;visual.layout(2,2);v.playing=true;v.motion.setRunning(true,v.testWallMs);v.updateIndicators();Surface surface;
   auto render=[&](){surface.target->BeginDraw();surface.target->Clear(D2D1::ColorF(D2D1::ColorF::Black));v.drawGroup(surface.g,v.group(2),2,v.current()+v.offset);check(surface.target->EndDraw());GdiFlush();return std::vector<BYTE>(surface.pixels,surface.pixels+Surface::width*Surface::height*4);};
-  auto stationary=render();bool ink=false;for(size_t i=0;i<stationary.size();i+=4)ink=ink||stationary[i]||stationary[i+1]||stationary[i+2];require(ink,"middle placeholder draws actual dot pixels");if(!directory.empty())surface.save(directory/"static-middle-placeholder.bmp");
-  v.testWallMs+=1000;v.position=2500;v.index=2;v.roles();require(render()==stationary,"placeholder pixels remain identical when time, progress and active row change");v.finishTransition();visual.interval(2500);expectNear(v.framePeriod,200,"static placeholder does not request animation frames");
-  v.valid=false;require(v.groupVisible(v.group(2),v.motionNow())&&render()==stationary,"static placeholder remains visible without confirmed progress during browse");
-  v.valid=true;v.stopBrowsing();v.update();require(!v.staticInterlude(v.group(2))&&v.showInterlude(v.group(2)),"returning to playback restores RNP interlude mode");v.testWallMs+=1000;require(render()!=stationary,"playback interlude resumes timed dot animation");
+  auto blankFrame=render();bool ink=false;for(size_t i=0;i<blankFrame.size();i+=4)ink=ink||blankFrame[i]||blankFrame[i+1]||blankFrame[i+2];require(!ink,"inactive middle interlude renders blank");if(!directory.empty())surface.save(directory/"blank-middle-interlude.bmp");
+  v.testWallMs+=1000;v.position=2500;v.index=2;v.playing=false;v.roles();v.updateIndicators();require(render()!=blankFrame,"paused current interlude draws dots while browsing");
+  v.valid=false;require(v.groupVisible(v.group(2),v.motionNow())&&render()==blankFrame,"unconfirmed progress preserves the blank row during browse");
+  v.valid=true;v.stopBrowsing();v.update();require(v.showInterlude(v.group(2)),"returning to playback keeps the current interlude selected");
   Fixture longGap;auto&l=longGap.a;for(int i=0;i<1002;i++){Line line;line.time=i*1000;line.duration=1000;line.isInterlude=i>0&&i<1001;if(!line.isInterlude)line.text=L"Visible lyric";l.lines.push_back(line);}l.position=500;l.index=0;l.valid=true;l.playing=true;longGap.layout(0);longGap.wheel(-120);require(l.browseIndex==1,"long middle gap is browsed through placeholder rows");const auto&first=l.group(0);const auto&last=l.group(1);require(l.groups.size()<=32&&l.lineBuildCalls<32,"long interlude run keeps text cache and layout construction bounded");
   require(l.transitionActive&&last.y.active(l.motionNow()),"moving onto a placeholder retains normal browse animation");for(int t=0;t<=250;t+=25){l.testWallMs=1000+t;expectNear(last.y.value(l.motionNow())-first.y.value(l.motionNow())-first.renderedHeight(first.zoom.value(l.motionNow())),7,"placeholder rows retain exact spacing throughout browse animation");}
  }
@@ -279,11 +279,11 @@ struct NativeTest {
   Fixture f;auto&a=f.a;f.lines(2);a.playing=false;f.layout(10);
   a.settingsPath=(directory/L"font-settings.json").wstring();
   auto verify=[&](int size){a.setLyricFontSize(size);FLOAT mainSize=0,subSize=0;
-   check(a.group(10).main.value->GetFontSize(0,&mainSize));check(a.group(10).subtitle.value->GetFontSize(0,&subSize));
+   check(a.group(10).content->main.value->GetFontSize(0,&mainSize));check(a.group(10).content->subtitle.value->GetFontSize(0,&subSize));
    expectNear(mainSize,size,"actual lyric layout font size");expectNear(subSize,16.f*size/21,"translation layout scales proportionally");
    require(a.flight.rows.empty()&&a.group(10).placed,"font change rebuilds positioned text without stale flight");
   };
-  verify(14);float smallWidth=a.group(10).main.width;verify(36);require(a.group(10).main.width>smallWidth,"larger font changes measured text width");verify(28);
+  verify(14);float smallWidth=a.group(10).content->main.width;verify(36);require(a.group(10).content->main.width>smallWidth,"larger font changes measured text width");verify(28);
   auto oldSettings=env(L"MINILYRICS_SETTINGS");SetEnvironmentVariableW(L"MINILYRICS_SETTINGS",a.settingsPath.c_str());
   try{App restored;expectNear(restored.currentFontSize,28,"font size persists in native settings");expectNear(restored.translationFontSize,16.f*28/21,"restored translation scale");}catch(...){SetEnvironmentVariableW(L"MINILYRICS_SETTINGS",oldSettings.empty()?nullptr:oldSettings.c_str());throw;}
   SetEnvironmentVariableW(L"MINILYRICS_SETTINGS",oldSettings.empty()?nullptr:oldSettings.c_str());
@@ -318,7 +318,7 @@ struct NativeTest {
   a.testWallMs=1900;a.update();require(a.flight.rows.empty(),"flight completes after 500ms plus stagger");expectNear(a.group(20).y.value(a.motionNow()),a.lyricAnchor(),"target lands exactly at lyric anchor");require(a.position==41000&&render()!=middle,"visual flight does not delay or change playback position");a.seekTo(41850);a.update();require(a.flight.focus==21&&a.flight.playbackIndex==20,"lookahead focus can precede actual playback row");a.position=42010;a.update();require(a.flight.playbackIndex==21&&a.flight.rows[21].to.mainAlpha==1&&!a.flight.stagger,"new playback row updates highlight without repeating the stagger");std::cout<<"PASS: forward seek and intermediate lyric pixels\n";
   a.seekTo(61000);a.update();a.testWallMs=2200;a.update();auto retargetFrame=render();a.seekTo(11000);a.update();require(render()==retargetFrame,"rapid backward seek continues from the currently displayed frame");double started=a.flight.started;Json clock=Json::obj();clock["type"]="clock";clock["position"]=11000;clock["playing"]=true;clock["valid"]=true;clock["seekState"]="pending";a.receive(clock);require(!a.flight.rows.empty()&&a.flight.started==started,"pending seek echo cannot reset flight");clock["seekState"]="confirmed";a.receive(clock);require(a.flight.started==started,"seek confirmation cannot restart flight");a.testWallMs=3100;a.update();require(a.flight.rows.empty()&&a.index==5,"rapid backward seek lands on latest target");std::cout<<"PASS: rapid retarget and pending/confirmed clock echoes\n";
   Fixture paused;auto&p=paused.a;paused.lines(2);paused.layout(10);p.playing=false;p.seekTo(41000);p.update();double frozen=p.motionNow();require(p.frameRunning,"paused seek temporarily schedules animation frames");float pausedStart=p.flight.rows[20].point.y;p.testWallMs=1300;p.update();require(p.motionNow()==frozen&&p.flight.rows[20].point.y<pausedStart,"paused playback clock stays frozen while flight advances");p.testWallMs=1900;p.update();require(p.flight.rows.empty()&&!p.frameRunning&&!p.playing&&p.position==41000,"paused seek finishes and returns to sleep without starting playback");
-  for(auto&line:p.lines)line.time+=5000;p.groups.clear();p.focusIndex=-999;p.position=46000;p.index=p.rowAt(p.position);paused.layout(p.index);p.updatePlaceholders();p.seekTo(0);p.update();p.testWallMs=2800;p.update();require(p.flight.rows.empty()&&p.lyricView()==App::LyricView::Prelude,"seek before first lyric lands in prelude state");expectNear(p.preludeDots.opacity.value(p.motionNow()),1,"paused prelude landing keeps frozen dots visible");std::cout<<"PASS: paused seek, idle scheduling and prelude landing\n";
+  for(auto&line:p.lines)line.time+=5000;p.groups.clear();p.focusIndex=-999;p.position=46000;p.index=p.rowAt(p.position);paused.layout(p.index);p.updatePlaceholders();p.seekTo(0);p.update();p.testWallMs=2800;p.update();require(p.flight.rows.empty()&&p.lyricView()==App::LyricView::Prelude,"seek before first lyric lands in prelude state");expectNear(p.preludeDots.opacity.value(p.indicatorNow()),1,"paused prelude landing keeps frozen dots visible");std::cout<<"PASS: paused seek, idle scheduling and prelude landing\n";
  }
  static void backgrounds(const std::filesystem::path&directory){
   BackgroundClock clock;clock.update(true,1,0);expectNear(clock.time(100),100,"background clock advances");clock.update(true,2,100);expectNear(clock.position(150),200,"speed changes preserve phase continuity");clock.update(false,2,150);expectNear(clock.position(1000),200,"pause freezes background phase");expectNear(clock.time(1000),150,"pause freezes texture sampling clock");clock.update(true,.5,1000);expectNear(clock.position(1200),300,"background resumes at selected speed");
@@ -474,7 +474,7 @@ struct NativeTest {
   double maximumDeviation=0;
   for(float zoom:{1.f,16.f/21.f})for(double time:{1350.,10500.}){
    g.zoom.snap(zoom);
-   auto found=std::find_if(g.glyphs.begin(),g.glyphs.end(),[&](const Glyph&w){return time>=w.time&&time<w.time+w.duration;});require(found!=g.glyphs.end(),"fixture has a currently sung word");
+   auto found=std::find_if(g.content->glyphs.begin(),g.content->glyphs.end(),[&](const Glyph&w){return time>=w.time&&time<w.time+w.duration;});require(found!=g.content->glyphs.end(),"fixture has a currently sung word");
    float cursor=found->x+found->layout.width*float((time-found->time)/found->duration);
    float x=cursor*zoom-(total*zoom-available)*a.horizontalPhase(g,time,0);
    require(x>=0&&x<=available,"currently sung position must remain inside the viewport despite uneven pacing");
@@ -489,12 +489,12 @@ struct NativeTest {
   Surface surface;auto frame=[&](double time){surface.target->BeginDraw();surface.target->Clear(D2D1::ColorF(D2D1::ColorF::Black));surface.target->PushAxisAlignedClip(D2D1::RectF(a.textX,0,a.width-12,130),D2D1_ANTIALIAS_MODE_ALIASED);a.drawGroup(surface.g,g,0,time);surface.target->PopAxisAlignedClip();check(surface.target->EndDraw());GdiFlush();return std::vector<BYTE>(surface.pixels,surface.pixels+Surface::width*Surface::height*4);};
   auto following=frame(1350);if(!directory.empty())surface.save(directory/"word-following.bmp");
   int subtitleTop=int(std::ceil(40+g.subtitleOffset(1.f))),subtitleBottom=std::min(130,int(std::ceil(40+g.renderedHeight(1.f))));
-  for(auto&w:g.glyphs){w.time+=20000;}
+  for(auto&w:g.content->glyphs){w.time+=20000;}
   auto delayed=frame(1350);if(!directory.empty())surface.save(directory/"word-timing-delayed.bmp");
   require(following!=delayed,"changing word timing changes actual native original pixels");
   size_t begin=subtitleTop*Surface::width*4,end=subtitleBottom*Surface::width*4;
   require(std::equal(following.begin()+begin,following.begin()+end,delayed.begin()+begin),"translation pixels retain the existing line-time marquee despite word timing changes");
-  for(auto&w:g.glyphs){w.time-=20000;}
+  for(auto&w:g.content->glyphs){w.time-=20000;}
   a.browseIndex=0;require(a.horizontalPhase(g,1350,0)==0,"manual browsing keeps the original aligned to its start");a.browseIndex=-1;
   a.playing=false;a.position=1350;auto paused=frame(a.current());a.testWallMs+=1000;require(frame(a.current())==paused,"paused playback holds word following without a separate scrolling clock");
   float atEnd=a.horizontalPhase(g,20000,0),atStart=a.horizontalPhase(g,0,0);require(atEnd==1&&atStart==0,"backward seeking immediately reanchors word following");
@@ -511,8 +511,27 @@ struct NativeTest {
   builds=a.lineBuildCalls;a.setRenderVisible(false);a.setRenderVisible(true);metrics["showAddedLayouts"]=double(a.lineBuildCalls-builds);bool shown=a.lineBuildCalls==builds;
   Json lyrics=Json::obj();lyrics["type"]="lyrics";lyrics["songId"]="";lyrics["lines"].kind=Json::Array;
   for(size_t i=0;i<a.lines.size();i++){Json line=Json::obj();line["time"]=a.lines[i].time;line["duration"]=a.lines[i].duration;line["text"]=narrow(a.lines[i].text);line["translation"]=i==12?"Updated translation":narrow(a.lines[i].translation);lyrics["lines"].array.push_back(line);}
-  builds=a.lineBuildCalls;id=a.group(10).identity;a.receive(lyrics);bool changed=a.group(12).model.translation==L"Updated translation"&&a.group(10).identity==id&&a.lineBuildCalls==builds+1;
+  builds=a.lineBuildCalls;id=a.group(10).identity;a.receive(lyrics);bool changed=a.group(12).content->model.translation==L"Updated translation"&&a.group(10).identity==id&&a.lineBuildCalls==builds+1;
   metrics["changedLineAddedLayouts"]=double(a.lineBuildCalls-builds);
+  {
+   Fixture cache;auto&host=cache.a;host.makeFormat(host.metaFormat,11.5f,DWRITE_FONT_WEIGHT_NORMAL);
+   host.receive(lyrics);
+   require(host.lyricLayouts.front()&&!host.lyricLayouts.back(),"first layout displays lyrics before warming distant lines");
+   host.message(WM_TIMER,host.LayoutWarmupTimer,0);
+   require(host.nextLayoutToWarm>0&&host.nextLayoutToWarm<host.lines.size(),"one warmup tick processes only a batch");
+   while(host.nextLayoutToWarm<host.lines.size())host.message(WM_TIMER,host.LayoutWarmupTimer,0);
+   require(std::all_of(host.lyricLayouts.begin(),host.lyricLayouts.end(),[](const auto&item){return bool(item);}),"warmup caches all song lines");
+   std::weak_ptr<LyricLayout> distant=host.lyricLayouts.back(),updated=host.lyricLayouts[25];
+   const auto warmBuilds=host.lineBuildCalls;
+   host.group(39);host.reflow(0,false);
+   require(!host.groups.count(39)&&host.group(39).content==distant.lock()&&host.lineBuildCalls==warmBuilds,"offscreen eviction preserves cached layout for reuse");
+   auto changedLyrics=lyrics;changedLyrics["lines"].array[25]["translation"]="Changed offscreen translation";
+   host.receive(changedLyrics);
+   require(updated.expired()&&host.lyricLayouts.back()==distant.lock(),"lyric revision releases only the changed cached line");
+   Json track=Json::obj();track["type"]="track";track["id"]="new-song";host.receive(track);
+   host.message(WM_TIMER,host.LayoutWarmupTimer,0);host.receive(lyrics);
+   require(distant.expired()&&host.lyricLayouts.empty()&&host.nextLayoutToWarm==0,"new track drops old layouts and ignores late lyrics and timer work");
+  }
   SetWindowPos(a.hwnd,nullptr,-30000,-30000,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);ShowWindow(a.hwnd,SW_SHOWNOACTIVATE);
   ValidateRect(a.hwnd,nullptr);Json style=Json::obj();style["type"]="style";style["curve"]=a.lineCurve;style["stagger"]=a.stagger;a.receive(style);bool unchanged=!GetUpdateRect(a.hwnd,nullptr,FALSE);
   if(!directory.empty()){
@@ -528,7 +547,7 @@ struct NativeTest {
    v.position=26000;v.index=v.rowAt(v.position);v.playing=false;v.updatePlaceholders();p.layout(v.index);v.seekTo(0);v.update();
    v.testWallMs+=900;v.applyFlight(v.animationWall());v.updateIndicators();Surface actual,expected;
    actual.target->BeginDraw();actual.target->Clear(D2D1::ColorF(D2D1::ColorF::Black));v.drawLyrics(actual.g,v.current());check(actual.target->EndDraw());
-   expected.target->BeginDraw();expected.target->Clear(D2D1::ColorF(D2D1::ColorF::Black));v.drawInterlude(expected.g,v.preludeDots,v.textX,v.lyricAnchor(),v.current(),0,v.lines.front().time);for(const auto& item:v.groups)if(v.groupVisible(item.second,v.motionNow()))v.drawGroup(expected.g,item.second,item.first,v.current());check(expected.target->EndDraw());GdiFlush();
+   expected.target->BeginDraw();expected.target->Clear(D2D1::ColorF(D2D1::ColorF::Black));v.drawInterludeAt(expected.g,v.preludeDots,v.textX,v.lyricAnchor(),v.current(),0,v.lines.front().time,v.indicatorNow());for(const auto& item:v.groups)if(v.groupVisible(item.second,v.motionNow()))v.drawGroup(expected.g,item.second,item.first,v.current());check(expected.target->EndDraw());GdiFlush();
    bool same=std::equal(actual.pixels,actual.pixels+Surface::width*Surface::height*4,expected.pixels);visiblePixels=visiblePixels&&same;metrics[words?"wordPreludeOnlyPreview":"plainPreludeOnlyPreview"]=same;
    if(!directory.empty())actual.save(directory/(words?"word-prelude-landing.bmp":"plain-prelude-landing.bmp"));
   }
@@ -545,14 +564,14 @@ struct NativeTest {
   auto clock=[&](double time,bool playing=true){Json m=Json::obj();m["type"]="clock";m["position"]=time;m["valid"]=true;m["playing"]=playing;a.receive(m);};
   Surface surface,reference;
   auto render=[&](){surface.target->BeginDraw();surface.target->Clear(D2D1::ColorF(D2D1::ColorF::Black));a.drawLyrics(surface.g,a.current()+a.offset);check(surface.target->EndDraw());GdiFlush();return std::vector<BYTE>(surface.pixels,surface.pixels+Surface::width*Surface::height*4);};
-  auto click=[&](int id,double target){auto&g=a.group(id);double beforePosition=a.position;int x=int(std::round((a.textX+8)*a.scale())),y=int(std::round((g.y.value(a.motionNow())+g.mainHeight*g.zoom.value(a.motionNow())*.5f)*a.scale()));a.hover=false;a.message(WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(x,y));require(a.seekPending&&a.position==beforePosition,"visible lyric click requests without fabricating progress");Json confirmed=Json::obj();confirmed["type"]="clock";confirmed["songId"]=a.songId;confirmed["position"]=target;confirmed["valid"]=true;confirmed["playing"]=a.playing;confirmed["seekState"]="confirmed";confirmed["seekRequest"]=double(a.seekRequest);a.receive(confirmed);require(!a.seekPending&&!a.flight.rows.empty(),"confirmed prelude seek retains the normal flight");};
+  auto click=[&](int id,double target){auto&g=a.group(id);double beforePosition=a.position;int x=int(std::round((a.textX+8)*a.scale())),y=int(std::round((g.y.value(a.motionNow())+g.content->mainHeight*g.zoom.value(a.motionNow())*.5f)*a.scale()));a.hover=false;a.message(WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(x,y));require(a.seekPending&&a.position==beforePosition,"visible lyric click requests without fabricating progress");Json confirmed=Json::obj();confirmed["type"]="clock";confirmed["songId"]=a.songId;confirmed["position"]=target;confirmed["valid"]=true;confirmed["playing"]=a.playing;confirmed["seekState"]="confirmed";confirmed["seekRequest"]=double(a.seekRequest);a.receive(confirmed);require(!a.seekPending&&!a.flight.rows.empty(),"confirmed prelude seek retains the normal flight");};
   track("early-lyrics");lyrics("early-lyrics",6000);clock(1000);a.testWallMs+=1000;a.update();
   require(a.groupVisible(a.group(1),a.motionNow())&&a.groupVisible(a.group(2),a.motionNow()),"implicit prelude must display later lyrics within viewport");
   auto before=render();if(!directory.empty())surface.save(directory/"prelude-preview.bmp");
   auto&g=a.group(0);bool visible=a.groupVisible(g,a.motionNow());Json metrics=Json::obj();metrics["visibleNormalPreview"]=visible;metrics["pass"]=false;if(!directory.empty()){std::ofstream report(directory/"prelude-results.json");report<<metrics.dump();}
   require(a.lyricView()==App::LyricView::Prelude&&visible,"prelude preview must be a visible normal lyric and click target");
   expectNear(g.zoom.value(a.motionNow()),ContextFontSize/CurrentFontSize,"prelude preview retains the context size");expectNear(g.y.value(a.motionNow()),a.lyricAnchor()+a.mainRowHeight+GroupGap,"preview stays below the prelude dots");
-  DWRITE_FONT_WEIGHT weight{};check(g.main.value->GetFontWeight(0,&weight,nullptr));require(weight==DWRITE_FONT_WEIGHT_SEMI_BOLD,"preview uses the original lyric font weight");
+  DWRITE_FONT_WEIGHT weight{};check(g.content->main.value->GetFontWeight(0,&weight,nullptr));require(weight==DWRITE_FONT_WEIGHT_SEMI_BOLD,"preview uses the original lyric font weight");
   reference.target->BeginDraw();reference.target->Clear(D2D1::ColorF(D2D1::ColorF::Black));a.drawGroup(reference.g,g,0,a.current());check(reference.target->EndDraw());GdiFlush();
   int top=int(std::floor(g.y.value(a.motionNow()))),bottom=std::min(Surface::height,int(std::ceil(g.y.value(a.motionNow())+g.renderedHeight(g.zoom.value(a.motionNow())))));
   require(std::equal(before.begin()+top*Surface::width*4,before.begin()+bottom*Surface::width*4,reference.pixels+top*Surface::width*4),"prelude preview pixels match the normal semibold lyric and translation");
@@ -561,12 +580,34 @@ struct NativeTest {
   require(a.index==0&&a.transitionActive,"natural first-line onset animates from the preview");a.testWallMs+=500;a.update();expectNear(a.group(0).zoom.value(a.motionNow()),1,"first line grows to the normal focus size");expectNear(a.group(0).y.value(a.motionNow()),a.lyricAnchor(),"first line returns to the normal focus anchor");
   // Clock-first arrival after a different song must replace the prior preview.
   track("late-lyrics");clock(1000);require(a.lyricView()==App::LyricView::Waiting,"clock-first track waits for its lyrics");lyrics("late-lyrics",10000,false,true);a.testWallMs+=1000;a.update();
-  require(a.groupVisible(a.group(0),a.motionNow())&&a.group(0).model.text==L"late-lyrics lyric 0","late lyrics replace the old preview and become clickable");click(0,10000);a.testWallMs+=900;a.update();
+  require(a.groupVisible(a.group(0),a.motionNow())&&a.group(0).content->model.text==L"late-lyrics lyric 0","late lyrics replace the old preview and become clickable");click(0,10000);a.testWallMs+=900;a.update();
   a.cancelSeek();a.seekTo(0);a.playing=false;a.update();a.testWallMs+=900;a.update();require(a.lyricView()==App::LyricView::Prelude&&a.flight.rows.empty(),"paused seek back lands in prelude");require(a.groupVisible(a.group(1),a.motionNow())&&a.group(1).opacity==1,"paused return retains later word lyrics");
   require(a.groupVisible(a.group(0),a.motionNow()),"returned prelude retains the same visible lyric target");click(0,10000);a.testWallMs+=900;a.update();require(a.flight.rows.empty()&&!a.frameRunning,"paused prelude click finishes its animation and sleeps");
   // RNP's explicit opening gap keeps the same ordinary-row input behavior.
   track("explicit-gap");lyrics("explicit-gap",6000,true);clock(1000);a.testWallMs+=1000;a.update();
   require(a.lyricView()==App::LyricView::Rows&&a.groupVisible(a.group(1),a.motionNow()),"explicit opening gap keeps the normal preview");require(a.groupVisible(a.group(2),a.motionNow())&&a.groupVisible(a.group(3),a.motionNow()),"explicit prelude also displays later lyrics");click(1,6000);
+  for(bool explicitGap:{false,true}){
+   const char*id=explicitGap?"paused-explicit-gap":"paused-prelude";
+   track(id);lyrics(id,6000,explicitGap);clock(1000);a.testWallMs+=1000;clock(1000,false);
+   auto dots=[&]() -> const InterludeAnimation& {return explicitGap?a.groups.at(0).dots:a.preludeDots;};
+   const double motion=a.motionNow();
+   expectNear(dots().opacity.value(a.indicatorNow()),1,"pausing in the opening gap keeps the dots visible");
+   const auto before=dots().dot(1000,0,6000,0,a.indicatorNow());
+   a.hover=true;
+   const LPARAM point=MAKELPARAM(int(std::round(a.transport.left+a.transport.length()*.2)),int(std::round(a.transport.y)));
+   a.message(WM_LBUTTONDOWN,MK_LBUTTON,point);a.message(WM_LBUTTONUP,0,point);
+   require(a.seekPending&&a.current()==1000,"progress-bar click waits for the paused seek confirmation");
+   Json confirmed=Json::obj();confirmed["type"]="clock";confirmed["songId"]=id;confirmed["position"]=6000;confirmed["valid"]=true;confirmed["playing"]=false;confirmed["seekState"]="confirmed";confirmed["seekRequest"]=double(a.seekRequest);a.receive(confirmed);
+   require(!a.seekPending&&!a.flight.rows.empty()&&a.frameRunning,"paused progress-bar seek animates the transition");
+   expectNear(dots().dot(6000,0,6000,0,a.indicatorNow()).alpha,before.alpha,"outgoing dots start from the previous position");
+   a.testWallMs+=250;a.update();
+   const float opacity=dots().opacity.value(a.indicatorNow());
+   require(opacity>0&&opacity<1,"opening dots fade while the paused seek animates");
+   expectNear(a.motionNow(),motion,"paused seek does not advance the lyric playback animation clock");
+   a.testWallMs+=750;a.update();
+   require(a.index==(explicitGap?1:0)&&a.current()==6000&&!a.playing&&!a.frameRunning,"pause and target are preserved after settling");
+   require(!dots().visible(a.indicatorNow()),"opening dots are gone after settling");
+  }
   metrics["pass"]=true;metrics["scenarios"]=3;metrics["normalFontPixels"]=true;metrics["clickRequests"]=4;metrics["lateArrival"]=true;metrics["pausedReturn"]=true;
   if(!directory.empty()){std::ofstream report(directory/"prelude-results.json");report<<metrics.dump();}
   std::cout<<"PASS: prelude font/pixels and clicks, late lyrics and paused return, explicit opening gap\n";

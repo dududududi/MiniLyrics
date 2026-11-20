@@ -1,5 +1,5 @@
 (function(){
-const MINILYRICS_VERSION="0.8.0";
+const MINILYRICS_VERSION="0.8.3";
 /* MiniLyrics, GPL-3.0-or-later. Pure normalization shared by plugin and tests. */
 (function (root) {
   'use strict';

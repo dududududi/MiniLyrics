@@ -45,20 +45,25 @@ struct Word {std::wstring text;double time=0,duration=1;bool operator==(const Wo
 struct Line {std::wstring text,translation;double time=0,duration=0;std::vector<Word> words;bool isInterlude=false;bool operator==(const Line&o)const{return text==o.text&&translation==o.translation&&time==o.time&&duration==o.duration&&words==o.words&&isInterlude==o.isInterlude;}};
 struct Layout {Com<IDWriteTextLayout> value;float width=0,height=0;};
 struct Glyph {Layout layout;double time=0,duration=1;float x=0;};
+struct LyricLayout {
+ Line model;Layout main,subtitle;std::vector<Glyph> glyphs;float mainHeight=0;
+ float height(bool translated)const{return mainHeight+(translated?TranslationGap+subtitle.height:0);}
+};
 struct LyricGroup {
- Line model;Layout main,subtitle;std::vector<Glyph> glyphs;std::vector<FloatWord> resetWords;InterludeAnimation dots;
- LineTrack y,zoom,mainAlpha,subAlpha;float mainHeight=0,opacity=1;double resetAt=-1000;uint64_t identity=0;bool translated=false,placed=false,active=false,browsePlaceholder=false;
- float subtitleOffset(float scale)const{return (mainHeight+TranslationGap)*scale;}
- float renderedHeight(float scale)const{return (mainHeight+(translated?TranslationGap+subtitle.height:0))*scale;}
+ std::shared_ptr<LyricLayout> content;
+ std::vector<FloatWord> resetWords;InterludeAnimation dots;
+ LineTrack y,zoom,mainAlpha,subAlpha;float opacity=1;double resetAt=-1000;uint64_t identity=0;bool translated=false,placed=false,active=false,middleInterlude=false;
+ float subtitleOffset(float scale)const{return (content->mainHeight+TranslationGap)*scale;}
+ float renderedHeight(float scale)const{return content->height(translated)*scale;}
 };
 // Whole-row visibility is independent of plain-text emphasis and word progress.
 struct FlightPoint {float y=0,zoom=1,mainAlpha=.4f,subAlpha=.4f,opacity=1;};
 struct FlightRow {FlightPoint from,to,point;float height=0;int bucket=0;};
 struct LyricFlight {
- std::vector<FlightRow> rows;double started=0;int focus=0,playbackIndex=-1,curve=0;bool stagger=true,prelude=false;
+ std::vector<FlightRow> rows;double started=0;int focus=0,playbackIndex=-1,curve=0;bool stagger=true,prelude=false,firstFrame=true;
  bool running(double now)const{return !rows.empty()&&now<started+500+(stagger?400:0);}
  struct Phase {double p[9]{},alpha=0;};
- Phase phase(double now)const{Phase out;for(int i=0;i<9;i++)out.p[i]=lineEase(unit((now-started-(stagger?i*50:0))/500),curve);out.alpha=lyricEase(unit((now-started)/500));return out;}
+ Phase phase(double now)const{Phase out;double elapsed=firstFrame?0:now-started;for(int i=0;i<9;i++)out.p[i]=lineEase(unit((elapsed-(stagger?i*50:0))/500),curve);out.alpha=lyricEase(unit(elapsed/500));return out;}
  FlightPoint sample(const FlightRow&r,const Phase&p)const{return {mixf(r.from.y,r.to.y,p.p[r.bucket]),mixf(r.from.zoom,r.to.zoom,p.p[r.bucket]),mixf(r.from.mainAlpha,r.to.mainAlpha,p.alpha),mixf(r.from.subAlpha,r.to.subAlpha,p.alpha),mixf(r.from.opacity,r.to.opacity,p.alpha)};}
 };
 struct CoverData {uint64_t epoch=0;UINT width=0,height=0;std::vector<BYTE> pixels;};
@@ -146,6 +151,10 @@ class App {
  Com<ID2D1HwndRenderTarget> target;Graphics graphics;Com<ID2D1RoundedRectangleGeometry> coverClip;
  Com<IDWriteTextFormat> mainFormat,secondaryFormat,metaFormat;
  Layout metaLayout,placeholder;int preludePreview=-1;std::map<int,LyricGroup>groups;InterludeAnimation preludeDots;LyricFlight flight;float secondaryRowHeight=0;
+ std::vector<std::shared_ptr<LyricLayout>> lyricLayouts;
+ size_t nextLayoutToWarm=0;
+ static constexpr UINT_PTR LayoutWarmupTimer=5;
+ LyricClock indicatorMotion;double lastIndicatorTime=0;
  LyricClock motion;bool transitionActive=false,snapRow=false,testWall=false,freezePlayback=false,layoutDirty=true,stagger=true;double testWallMs=0;int focusIndex=-999,lineCurve=0,browseIndex=-1,wheelRemainder=0;double browseUntil=0;bool returnFromBrowse=false,manualTransition=false,manualLayoutPending=false;float viewportTop=32,viewportBottom=98,layoutAnchor=44,mainRowHeight=28;uint64_t groupSerial=0,layoutChanges=0;
  Com<ID2D1PathGeometry> playGeometry;
  std::vector<Line> lines;CoverData cover;BackgroundSettings background;BackgroundClock backgroundClock;FluidBackground fluid;
@@ -164,6 +173,7 @@ class App {
  double current()const{return position+(playing&&valid&&!freezePlayback?std::max(0.,nowMs()-anchor):0.);}
  double animationWall()const{return testWall?testWallMs:nowMs();}
  double motionNow()const{return motion.now(animationWall());}
+ double indicatorNow()const{return indicatorMotion.now(animationWall());}
  void stopBrowsing(bool animateReturn=false){browseIndex=-1;wheelRemainder=0;browseUntil=0;returnFromBrowse=true;manualTransition=manualLayoutPending=animateReturn;KillTimer(hwnd,4);layoutDirty=true;}
  void finishTransition(){for(auto&item:groups){auto&g=item.second;g.y.snap(g.y.to);g.zoom.snap(g.zoom.to);g.mainAlpha.snap(g.mainAlpha.to);g.subAlpha.snap(g.subAlpha.to);}transitionActive=false;manualTransition=false;manualLayoutPending=false;}
  float scale()const{return dpi/96.f;}
@@ -172,9 +182,9 @@ class App {
  bool staticPreview()const{return untimed||(!valid&&!hasClock);}
  LyricView lyricView()const{if(lines.empty())return LyricView::Waiting;if(browseIndex>=0)return LyricView::Rows;if(staticPreview())return LyricView::StaticPreview;return index<0?LyricView::Prelude:LyricView::Rows;}
  float rowAnchor()const{return lyricAnchor()+(lyricView()==LyricView::Prelude?mainRowHeight+GroupGap:0);}
- bool emptyGroup(const LyricGroup&g)const{return g.model.text.empty()&&g.model.words.empty()&&g.glyphs.empty()&&!g.translated;}
+ bool emptyGroup(const LyricGroup&g)const{return g.content->model.text.empty()&&g.content->model.words.empty()&&!g.translated;}
  bool isInterlude(const Line&line)const{return line.isInterlude||(line.text.empty()&&line.words.empty()&&line.translation.empty());}
- bool isInterlude(const LyricGroup&g)const{return isInterlude(g.model);}
+ bool isInterlude(const LyricGroup&g)const{return isInterlude(g.content->model);}
  std::pair<int,int> browseBounds()const{int first=0,last=int(lines.size())-1;while(first<=last&&isInterlude(lines[first]))++first;while(last>=first&&isInterlude(lines[last]))--last;return first<=last?std::make_pair(first,last):std::make_pair(-1,-1);}
  int browseNeighbor(int at,int direction)const{auto bounds=browseBounds();if(bounds.first<0)return -1;int next=at+direction;next=direction>0?std::max(next,bounds.first):std::min(next,bounds.second);return next>=bounds.first&&next<=bounds.second?next:-1;}
  int browseFocus(int at)const{auto bounds=browseBounds();return bounds.first<0?-1:std::max(bounds.first,std::min(bounds.second,at));}
@@ -183,11 +193,28 @@ class App {
   if(at<bounds.first||at>bounds.second){at=std::max(bounds.first,std::min(bounds.second,at));--count;}
   return std::max(bounds.first,std::min(bounds.second,at+direction*count));
  }
- bool staticInterlude(const LyricGroup&g)const{return browseIndex>=0&&g.browsePlaceholder;}
- bool showInterlude(const LyricGroup&g)const{return valid&&!untimed&&browseIndex<0&&g.active&&isInterlude(g);}
- bool indicatorVisible(const LyricGroup&g)const{return valid&&!untimed&&browseIndex<0&&isInterlude(g)&&g.dots.visible(motionNow());}
- bool groupVisible(const LyricGroup&g,double now)const{if(g.opacity<=.001f)return false;if(browseIndex>=0&&isInterlude(g)&&!staticInterlude(g))return false;if(emptyGroup(g)&&!indicatorVisible(g)&&!staticInterlude(g))return false;float y=g.y.value(now);return y+g.renderedHeight(g.zoom.value(now))>=viewportTop&&y<=viewportBottom;}
- void updateIndicators(){double now=motionNow(),time=current()+offset;bool prelude=lyricView()==LyricView::Prelude;preludeDots.update(prelude,playing&&valid,now,time,0,lines.empty()?0:lines.front().time);if(prelude&&!playing&&valid)preludeDots.opacity.snap(1);for(auto&item:groups){auto&g=item.second;bool selected=showInterlude(g);g.dots.update(selected,playing&&valid,now,time,g.model.time,interludeDuration(g.model,item.first));if(selected&&!playing)g.dots.opacity.snap(1);}}
+ bool showInterlude(const LyricGroup&g)const{return valid&&!untimed&&g.active&&isInterlude(g);}
+ bool indicatorVisible(const LyricGroup&g)const{return valid&&!untimed&&isInterlude(g)&&g.dots.visible(indicatorNow());}
+ bool groupVisible(const LyricGroup&g,double now)const{if(g.opacity<=.001f)return false;if(emptyGroup(g)&&!indicatorVisible(g)&&!g.middleInterlude)return false;float y=g.y.value(now);return y+g.renderedHeight(g.zoom.value(now))>=viewportTop&&y<=viewportBottom;}
+ void updateIndicators(){
+  const bool playingTimedLyrics=playing&&valid&&!untimed;
+  const bool seeking=!flight.rows.empty();
+  const double wall=animationWall(),time=current()+offset;
+  // A paused seek still animates the indicator's exit without advancing playback.
+  indicatorMotion.setRunning(playingTimedLyrics||seeking,wall);
+  const double now=indicatorMotion.now(wall);
+  auto updateIndicator=[&](InterludeAnimation&dots,bool selected,double start,double duration){
+   const double dotTime=seeking&&!selected?lastIndicatorTime:time;
+   dots.update(selected,playingTimedLyrics,now,dotTime,start,duration);
+   if(!playingTimedLyrics){
+    if(selected)dots.opacity.snap(1);
+    else if(!seeking)dots.opacity.snap(0);
+   }
+  };
+  updateIndicator(preludeDots,valid&&lyricView()==LyricView::Prelude,0,lines.empty()?0:lines.front().time);
+  for(auto&item:groups){auto&g=item.second;const auto&line=g.content->model;updateIndicator(g.dots,showInterlude(g),line.time,interludeDuration(line,item.first));}
+  lastIndicatorTime=time;
+ }
  double interludeDuration(const Line&line,int id)const{if(line.duration>0)return line.duration;if(id>=0&&id+1<int(lines.size()))return std::max(0.,lines[id+1].time-line.time);return std::max(0.,duration-line.time);}
  int rowAt(double time)const {int lo=0,hi=int(lines.size())-1,result=-1;while(lo<=hi){int mid=(lo+hi)/2;if(lines[mid].time<=time){result=mid;lo=mid+1;}else hi=mid-1;}return result;}
  Layout layout(const std::wstring&text,IDWriteTextFormat*format,float maxWidth=50000){Layout l;if(text.empty())return l;check(textFactory->CreateTextLayout(text.c_str(),UINT32(text.size()),format,maxWidth,64,l.value.put()));DWRITE_TEXT_METRICS metrics{};check(l.value->GetMetrics(&metrics));l.width=metrics.widthIncludingTrailingWhitespace;l.height=metrics.height;return l;}
@@ -200,26 +227,58 @@ class App {
   currentFontSize=size;contextFontSize=::ContextFontSize*size/::CurrentFontSize;translationFontSize=::TranslationFontSize*size/::CurrentFontSize;
   mainRowHeight=layout(L"Ag",mainFormat.get()).height;secondaryRowHeight=0;
   flight=LyricFlight();groups.clear();focusIndex=-999;transitionActive=false;layoutDirty=true;snapRow=true;
-  placeholder=Layout();updatePlaceholders();save();update();
+  lyricLayouts.clear();nextLayoutToWarm=0;
+  placeholder=Layout();updatePlaceholders();save();update();scheduleLayoutWarmup();
  }
  void rebuildMeta(){metaLayout=layout(title+(artist.empty()?L"":L"  ·  "+artist),metaFormat.get(),std::max(20.f,width-textX-85));if(metaLayout.value){DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};Com<IDWriteInlineObject>sign;if(SUCCEEDED(textFactory->CreateEllipsisTrimmingSign(metaFormat.get(),sign.put())))metaLayout.value->SetTrimming(&trim,sign.get());}}
- void ensureGlyphs(LyricGroup&g){
-  if(!g.glyphs.empty()||g.model.words.empty())return;
+ const std::shared_ptr<LyricLayout>& cachedLayout(size_t at){
+  if(lyricLayouts.size()!=lines.size())lyricLayouts.resize(lines.size());
+  auto&cached=lyricLayouts[at];const auto&line=lines[at];
+  if(cached&&cached->model==line)return cached;
+  auto built=std::make_shared<LyricLayout>();built->model=line;
+  built->main=layout(line.text,mainFormat.get());built->mainHeight=built->main.height;
+  built->glyphs.reserve(line.words.size());
   float x=0;
-  for(const auto&word:g.model.words){Glyph glyph;glyph.layout=layout(word.text,mainFormat.get());glyph.x=x;glyph.time=word.time;glyph.duration=word.duration;x+=glyph.layout.width;g.mainHeight=std::max(g.mainHeight,glyph.layout.height);g.glyphs.push_back(std::move(glyph));}
+  for(const auto&word:line.words){
+   Glyph glyph;
+   glyph.layout=layout(word.text,mainFormat.get());
+   glyph.time=word.time;
+   glyph.duration=word.duration;
+   glyph.x=x;
+   x+=glyph.layout.width;
+   built->mainHeight=std::max(built->mainHeight,glyph.layout.height);
+   built->glyphs.push_back(std::move(glyph));
+  }
+  if(built->mainHeight<=0)built->mainHeight=mainRowHeight;
+  built->subtitle=layout(line.translation,secondaryFormat.get());
+  cached=std::move(built);lineBuildCalls++;return cached;
+ }
+ void scheduleLayoutWarmup(){
+  if(!hwnd)return;
+  if(renderVisible&&nextLayoutToWarm<lines.size())SetTimer(hwnd,LayoutWarmupTimer,15,nullptr);
+  else KillTimer(hwnd,LayoutWarmupTimer);
+ }
+ void warmLyricLayouts(){
+  if(!renderVisible||closing||nextLayoutToWarm>=lines.size()){KillTimer(hwnd,LayoutWarmupTimer);return;}
+  if(seekPending||!flight.rows.empty()||resizing||systemMoving)return;
+  // WM_TIMER lets painting and input take priority. Yield after a small batch.
+  const double deadline=nowMs()+2;
+  for(int count=0;count<8&&nextLayoutToWarm<lines.size();++count){
+   cachedLayout(nextLayoutToWarm++);
+   if(nowMs()>=deadline)break;
+  }
+  if(nextLayoutToWarm>=lines.size())KillTimer(hwnd,LayoutWarmupTimer);
  }
  LyricGroup& group(int at){
-  auto result=groups.try_emplace(at);auto&g=result.first->second;const auto&line=lines[at];
-  if(!result.second&&g.model==line&&g.translated==(translation&&!line.translation.empty())){if(at==index)ensureGlyphs(g);return g;}
-  bool same=!result.second&&g.model.time==line.time&&g.model.text==line.text;
+  const auto&content=cachedLayout(at);const auto&line=content->model;
+  auto&g=groups.try_emplace(at).first->second;
+  bool translated=translation&&!line.translation.empty();
+  if(g.content==content&&g.translated==translated)return g;
+  bool same=g.content&&g.content->model.time==line.time&&g.content->model.text==line.text;
   auto y=g.y,z=g.zoom,ma=g.mainAlpha,sa=g.subAlpha;auto dots=g.dots;float opacity=g.opacity;bool placed=g.placed;uint64_t id=same?g.identity:++groupSerial;
-  g=LyricGroup();g.model=line;g.identity=id;g.translated=translation&&!line.translation.empty();g.y=y;g.zoom=z;g.placed=placed;g.mainAlpha=ma;g.subAlpha=sa;g.opacity=opacity;
+  g=LyricGroup();g.content=content;g.identity=id;g.translated=translated;g.y=y;g.zoom=z;g.placed=placed;g.mainAlpha=ma;g.subAlpha=sa;g.opacity=opacity;
   if(same)g.dots=dots;
-  g.main=layout(line.text,mainFormat.get());g.mainHeight=g.main.height;
-  if(at==index)ensureGlyphs(g);
-  if(g.mainHeight<=0)g.mainHeight=mainRowHeight;
-  if(g.translated)g.subtitle=layout(line.translation,secondaryFormat.get());
-  g.mainAlpha.snap(at==index?1.f:.4f);g.subAlpha.snap(at==index?.8f:.4f);g.active=at==index;lineBuildCalls++;return g;
+  g.mainAlpha.snap(at==index?1.f:.4f);g.subAlpha.snap(at==index?.8f:.4f);g.active=at==index;return g;
  }
  float groupScale(int at,int focus){return at==focus&&lyricView()!=LyricView::Prelude?1.f:contextFontSize/currentFontSize;}
  int layoutDistance(int at,int focus,int limit)const{
@@ -235,18 +294,24 @@ class App {
  }
  void roles(){
   double now=motionNow(),time=current()+offset;
-  for(auto&item:groups){auto&g=item.second;bool active=item.first==index;if(active)ensureGlyphs(g);if(active==g.active)continue;
-   if(g.active){g.resetWords.clear();for(const auto&w:g.glyphs)g.resetWords.push_back(floatWord(time-w.time,w.duration));g.resetAt=now;}
+  for(auto&item:groups){auto&g=item.second;bool active=item.first==index;if(active==g.active)continue;
+   if(g.active){g.resetWords.clear();for(const auto&w:g.content->glyphs)g.resetWords.push_back(floatWord(time-w.time,w.duration));g.resetAt=now;}
    g.active=active;g.mainAlpha.target(active?1.f:.4f,now);g.subAlpha.target(active?.8f:.4f,now);
   }
  }
  void beginFlight(int desired,int playbackIndex){
   if(lines.empty()||focusIndex<0)return;if(playbackIndex<0&&preludePreview>=0)desired=preludePreview;desired=std::max(0,std::min(int(lines.size())-1,desired));double now=animationWall(),motionTime=motionNow();bool sourcePrelude=flight.rows.empty()&&lyricView()==LyricView::Prelude,sourceBrowse=browseIndex>=0;int sourceFocus=std::max(0,std::min(int(lines.size())-1,focusIndex));
-  for(int i=std::max(0,desired-6);i<=std::min(int(lines.size())-1,desired+6);i++)group(i);
+  // Only the destination rows need exact heights before we know what is visible.
+  group(desired);
+  if(playbackIndex>=0&&playbackIndex!=desired)group(playbackIndex);
   if(secondaryRowHeight<=0)secondaryRowHeight=layout(L"Ag",secondaryFormat.get()).height;
   std::vector<float> heights(lines.size()),prefix(lines.size()+1),sourcePrefix(lines.size()+1);auto bounds=sourceBrowse?browseBounds():std::make_pair(-1,-1);float context=contextFontSize/currentFontSize;
-  for(size_t i=0;i<lines.size();i++){auto found=groups.find(int(i));heights[i]=found!=groups.end()&&found->second.model==lines[i]?found->second.renderedHeight(1):mainRowHeight+(translation&&!lines[i].translation.empty()?TranslationGap+secondaryRowHeight:0);float step=heights[i]*context+GroupGap;prefix[i+1]=prefix[i]+step;sourcePrefix[i+1]=sourcePrefix[i]+(!sourceBrowse||(int(i)>=bounds.first&&int(i)<=bounds.second)?step:0);}
-  auto previous=std::move(flight);auto previousPhase=previous.phase(now);flight=LyricFlight();flight.rows.resize(lines.size());flight.started=now;flight.focus=desired;flight.playbackIndex=playbackIndex;flight.curve=lineCurve;flight.stagger=stagger&&desired!=sourceFocus;flight.prelude=playbackIndex<0;int direction=desired>=sourceFocus?1:-1;
+  for(size_t i=0;i<lines.size();i++){
+   const auto&cached=lyricLayouts[i];const bool translated=translation&&!lines[i].translation.empty();
+   heights[i]=cached?cached->height(translated):mainRowHeight+(translated?TranslationGap+secondaryRowHeight:0);
+   const float step=heights[i]*context+GroupGap;prefix[i+1]=prefix[i]+step;sourcePrefix[i+1]=sourcePrefix[i]+(!sourceBrowse||(int(i)>=bounds.first&&int(i)<=bounds.second)?step:0);
+  }
+  auto previous=std::move(flight);auto previousPhase=previous.phase(now);flight=LyricFlight();flight.rows.resize(lines.size());flight.focus=desired;flight.playbackIndex=playbackIndex;flight.curve=lineCurve;flight.stagger=stagger&&desired!=sourceFocus;flight.prelude=playbackIndex<0;int direction=desired>=sourceFocus?1:-1;
   float destinationAnchor=lyricAnchor()+(flight.prelude?mainRowHeight+GroupGap:0),sourceAnchor=layoutAnchor;
   for(size_t i=0;i<lines.size();i++){
    auto&r=flight.rows[i];r.height=heights[i];r.bucket=std::max(-4,std::min(4,int(i)-desired))*direction+4;
@@ -260,10 +325,13 @@ class App {
   auto phase=flight.phase(now);std::vector<int>wanted;wanted.reserve(32);auto add=[&](int id){if(id>=0&&id<int(lines.size())&&wanted.size()<32&&std::find(wanted.begin(),wanted.end(),id)==wanted.end())wanted.push_back(id);};
   for(size_t i=0;i<flight.rows.size();i++){auto&r=flight.rows[i];r.point=flight.sample(r,phase);if(r.point.y+r.height*r.point.zoom>=viewportTop&&r.point.y<=viewportBottom)add(int(i));}
   for(size_t i=0;i<flight.rows.size();i++){const auto&r=flight.rows[i];if(r.point.y+r.height*r.point.zoom>=viewportTop-mainRowHeight*2&&r.point.y<=viewportBottom+mainRowHeight*2)add(int(i));}
-  for(int i=flight.focus-2;i<=flight.focus+2;i++)add(i);
+  add(flight.focus);add(flight.playbackIndex);
   for(auto it=groups.begin();it!=groups.end();)if(std::find(wanted.begin(),wanted.end(),it->first)==wanted.end())it=groups.erase(it);else ++it;
-  for(int id:wanted){auto&g=group(id);const auto&p=flight.rows[id].point;g.y.snap(p.y);g.zoom.snap(p.zoom);g.mainAlpha.snap(p.mainAlpha);g.subAlpha.snap(p.subAlpha);g.opacity=p.opacity;g.placed=true;g.active=id==index;if(g.active)ensureGlyphs(g);g.browsePlaceholder=false;}
+  auto interludeBounds=browseBounds();
+  for(int id:wanted){auto&g=group(id);const auto&p=flight.rows[id].point;g.y.snap(p.y);g.zoom.snap(p.zoom);g.mainAlpha.snap(p.mainAlpha);g.subAlpha.snap(p.subAlpha);g.opacity=p.opacity;g.placed=true;g.active=id==index;g.middleInterlude=interludeBounds.first>=0&&id>interludeBounds.first&&id<interludeBounds.second&&isInterlude(g);}
   focusIndex=flight.focus;layoutAnchor=lyricAnchor()+(flight.prelude?mainRowHeight+GroupGap:0);layoutDirty=false;
+  // Keep layout work from consuming the first frames of the transition.
+  if(flight.firstFrame){flight.started=animationWall();flight.firstFrame=false;}
  }
  void seekTo(double target){
   target=std::max(0.,duration>0?std::min(duration,target):target);bool canFly=renderVisible&&!untimed&&valid&&!lines.empty()&&focusIndex>=0&&!groups.empty();
@@ -312,7 +380,8 @@ class App {
    if(!keep&&(!animate||!it->second.y.active(now)||y+it->second.renderedHeight(it->second.zoom.value(now))<viewportTop-8||y>viewportBottom+8))it=groups.erase(it);else ++it;
   }
   while(groups.size()>32){auto farthest=groups.end();for(auto it=groups.begin();it!=groups.end();++it)if(it->first!=index&&(farthest==groups.end()||std::abs(it->first-desired)>std::abs(farthest->first-desired)))farthest=it;if(farthest==groups.end())break;groups.erase(farthest);}
-  for(auto&item:groups)item.second.browsePlaceholder=browseIndex>=0&&item.first>bounds.first&&item.first<bounds.second&&isInterlude(item.second);
+  auto interludeBounds=browseIndex>=0?bounds:browseBounds();
+  for(auto&item:groups)item.second.middleInterlude=interludeBounds.first>=0&&item.first>interludeBounds.first&&item.first<interludeBounds.second&&isInterlude(item.second);
   if(previous!=desired){rowSince=now;layoutChanges++;}
   roles();layoutDirty=false;
  }
@@ -346,58 +415,54 @@ class App {
   }if(!graphics.target)graphics.init(target.get(),bgA,bgB,cover,width,height);
  }
  void text(Graphics&g,const Layout&l,float x,float y,D2D1_COLOR_F color,float alpha=1){if(!l.value)return;g.brush->SetColor(color);g.brush->SetOpacity(alpha);g.target->DrawTextLayout(D2D1::Point2F(x,y),l.value.get(),g.brush.get(),D2D1_DRAW_TEXT_OPTIONS_NONE);g.brush->SetOpacity(1);}
- float rowWidth(const LyricGroup&g)const{return g.glyphs.empty()?g.main.width:g.glyphs.back().x+g.glyphs.back().layout.width;}
+ float rowWidth(const LyricGroup&g)const{return g.content->glyphs.empty()?g.content->main.width:g.content->glyphs.back().x+g.content->glyphs.back().layout.width;}
  bool canScroll(int id)const{return !staticPreview()&&browseIndex<0&&id<=index;}
  float timedHorizontalPhase(const LyricGroup&g,double time,int id)const{
   if(!canScroll(id))return 0;
-  const Line*line=&g.model;
+  const Line*line=&g.content->model;
   return float(clamp((time-line->time-900)/std::max(1200.,(line->duration>0?line->duration:4000)-1600),0,1));
  }
  float horizontalPhase(const LyricGroup&g,double time,int id,double now)const{
-  if(g.glyphs.empty())return timedHorizontalPhase(g,time,id);
+  if(g.content->glyphs.empty())return timedHorizontalPhase(g,time,id);
   if(!canScroll(id))return 0;
   float zoom=std::max(.01f,g.zoom.value(now)),available=std::max(1.f,width-textX-12),overflow=rowWidth(g)*zoom-available;
   if(overflow<=0)return 0;
-  const auto&last=g.glyphs.back();if(time>=last.time+last.duration)return 1;
+  const auto&last=g.content->glyphs.back();if(time>=last.time+last.duration)return 1;
   // Track the sung position in measured text space. Gaps hold this cursor;
   // seeking is stateless, and contiguous word boundaries stay continuous.
   float cursor=0;
-  for(const auto&w:g.glyphs)if(time>=w.time)cursor=std::max(cursor,w.x+w.layout.width*float(unit((time-w.time)/w.duration)));
+  for(const auto&w:g.content->glyphs)if(time>=w.time)cursor=std::max(cursor,w.x+w.layout.width*float(unit((time-w.time)/w.duration)));
   return float(clamp((cursor*zoom-available*.5f)/overflow,0,1));
  }
  float horizontalPhase(const LyricGroup&g,double time,int id)const{return horizontalPhase(g,time,id,motionNow());}
- void drawInterludeAt(Graphics&g,const InterludeAnimation&animation,float x,float y,double time,double start,double duration,double now,float opacity=1,bool stationary=false){
-  float alpha=opacity*(stationary?1.f:animation.opacity.value(now));if(alpha<=0)return;
-  float breath=stationary?1.f:animation.scale(now),diameter=currentFontSize*.7f,gap=currentFontSize*.5f;
+ void drawInterludeAt(Graphics&g,const InterludeAnimation&animation,float x,float y,double time,double start,double duration,double now,float opacity=1){
+  float alpha=opacity*animation.opacity.value(now);if(alpha<=0)return;
+  float breath=animation.scale(now),diameter=currentFontSize*.7f,gap=currentFontSize*.5f;
   g.brush->SetColor(D2D1::ColorF(D2D1::ColorF::White));
-  for(int i=0;i<3;i++){auto dot=stationary?InterludeDot{.4f,.9f}:animation.dot(time,start,duration,i,now);float radius=diameter*.5f*dot.scale*breath;g.brush->SetOpacity(alpha*dot.alpha);g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x+(diameter*.5f+i*(diameter+gap))*breath,y+mainRowHeight*.5f),radius,radius),g.brush.get());}
+  for(int i=0;i<3;i++){auto dot=animation.dot(time,start,duration,i,now);float radius=diameter*.5f*dot.scale*breath;g.brush->SetOpacity(alpha*dot.alpha);g.target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x+(diameter*.5f+i*(diameter+gap))*breath,y+mainRowHeight*.5f),radius,radius),g.brush.get());}
   g.brush->SetOpacity(1);
- }
- void drawInterlude(Graphics&g,const InterludeAnimation&animation,float x,float y,double time,double start,double duration,float opacity=1,bool stationary=false){
-  drawInterludeAt(g,animation,x,y,time,start,duration,motionNow(),opacity,stationary);
  }
  void drawGroupAt(Graphics&g,const LyricGroup&r,int id,double time,double now){
   if(r.opacity<=0)return;float zoom=std::max(.01f,r.zoom.value(now)),y=r.y.value(now);
   float available=std::max(1.f,width-textX-12),phase=horizontalPhase(r,time,id,now);
   D2D1_MATRIX_3X2_F transform;bool scaled=zoom!=1.f;float originX=textX,originY=y;
   if(scaled){g.target->GetTransform(&transform);g.target->SetTransform(D2D1::Matrix3x2F::Scale(zoom,zoom)*D2D1::Matrix3x2F::Translation(textX,y)*transform);originX=originY=0;}
-  if(staticInterlude(r)){drawInterludeAt(g,r.dots,originX,originY,0,0,0,now,r.opacity,true);if(scaled)g.target->SetTransform(transform);return;}
   float x=originX-std::max(0.f,rowWidth(r)*zoom-available)*phase/zoom;
   bool resetting=!r.active&&!r.resetWords.empty()&&now-r.resetAt<200;
-  if(r.glyphs.empty()||staticPreview()||(!r.active&&!resetting))text(g,r.main,x,originY,D2D1::ColorF(D2D1::ColorF::White),(staticPreview()?(id==focusIndex?1.f:.4f):r.mainAlpha.value(now))*r.opacity);
+  if(r.content->glyphs.empty()||staticPreview())text(g,r.content->main,x,originY,D2D1::ColorF(D2D1::ColorF::White),(staticPreview()?(id==focusIndex?1.f:.4f):r.mainAlpha.value(now))*r.opacity);
   else{
    float clipLeft=originX-2.f,clipRight=originX+available/zoom+2.f;
-   for(size_t i=0;i<r.glyphs.size();i++){
-    const auto&w=r.glyphs[i];float wx=x+w.x;
+   for(size_t i=0;i<r.content->glyphs.size();i++){
+    const auto&w=r.content->glyphs[i];float wx=x+w.x;
     if(wx+w.layout.width<clipLeft||wx>clipRight)continue;
     FloatWord f{.4f,0};
     if(r.active)f=floatWord(time-w.time,w.duration);
-    else if(i<r.resetWords.size()){double p=unit((now-r.resetAt)/200);f={mixf(r.resetWords[i].alpha,.4f,p),mixf(r.resetWords[i].lift,0,lyricEase(p))};}
+    else if(resetting&&i<r.resetWords.size()){double p=unit((now-r.resetAt)/200);f={mixf(r.resetWords[i].alpha,.4f,p),mixf(r.resetWords[i].lift,0,lyricEase(p))};}
     text(g,w.layout,wx,originY-f.lift,D2D1::ColorF(D2D1::ColorF::White),f.alpha*r.opacity);
    }
   }
-  if(indicatorVisible(r))drawInterludeAt(g,r.dots,originX,originY,time,r.model.time,interludeDuration(r.model,id),now,r.mainAlpha.value(now)*r.opacity);
-  if(r.translated){float subX=originX-std::max(0.f,r.subtitle.width*zoom-available)*timedHorizontalPhase(r,time,id)/zoom;text(g,r.subtitle,subX,originY+r.subtitleOffset(1.f),D2D1::ColorF(D2D1::ColorF::White),(staticPreview()?(id==focusIndex?.8f:.4f):r.subAlpha.value(now))*r.opacity);}
+  if(indicatorVisible(r))drawInterludeAt(g,r.dots,originX,originY,time,r.content->model.time,interludeDuration(r.content->model,id),indicatorNow(),r.mainAlpha.value(now)*r.opacity);
+  if(r.translated){float subX=originX-std::max(0.f,r.content->subtitle.width*zoom-available)*timedHorizontalPhase(r,time,id)/zoom;text(g,r.content->subtitle,subX,originY+r.subtitleOffset(1.f),D2D1::ColorF(D2D1::ColorF::White),(staticPreview()?(id==focusIndex?.8f:.4f):r.subAlpha.value(now))*r.opacity);}
   if(scaled)g.target->SetTransform(transform);
  }
  void drawGroup(Graphics&g,const LyricGroup&r,int id,double time){drawGroupAt(g,r,id,time,motionNow());}
@@ -423,11 +488,12 @@ class App {
   g.backgroundBrush->SetTransform(D2D1::Matrix3x2F::Scale(width/FluidBackground::width,height/FluidBackground::height));g.target->FillRoundedRectangle(card,g.backgroundBrush.get());
  }
  void drawLyricsAt(Graphics&g,double time,double now){
-  float y=lyricAnchor();if(!flight.rows.empty()){if(preludeDots.visible(now))drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,now);}
+  float y=lyricAnchor();double dotsNow=indicatorNow();
+  if(!flight.rows.empty()){if(preludeDots.visible(dotsNow))drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,dotsNow);}
   else switch(lyricView()){
    case LyricView::Waiting:text(g,placeholder,textX,y,D2D1::ColorF(D2D1::ColorF::White));return;
    case LyricView::StaticPreview:break;
-   case LyricView::Prelude:drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,now);break;
+   case LyricView::Prelude:drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,dotsNow);break;
    case LyricView::Rows:break;
   }
   for(const auto&item:groups)if(groupVisible(item.second,now))drawGroupAt(g,item.second,item.first,time,now);
@@ -479,17 +545,17 @@ class App {
  void stopFrames(){if(frameRunning||frameArmed){KillTimer(hwnd,1);if(frameTimer)CancelWaitableTimer(frameTimer);}frameArmed=false;frameRunning=false;frameDeadline=0;}
  void setRenderVisible(bool visible){
   if(renderVisible==visible)return;renderVisible=visible;
-  if(!visible){flight=LyricFlight();stopBrowsing();snapRow=true;layoutDirty=true;}
-  update();
+  if(!visible){indicatorMotion.setRunning(false,animationWall());flight=LyricFlight();stopBrowsing();snapRow=true;layoutDirty=true;}
+  update();scheduleLayoutWarmup();
  }
  void schedule(){
   if(!renderVisible){stopFrames();return;}
   double time=current()+offset,next=200;bool active=manualTransition||(playing&&valid&&(transitionActive||lyricView()==LyricView::Prelude));
   if(playing&&valid&&!untimed&&index+1<int(lines.size())){next=std::min(next,std::max(1.,lines[index+1].time-time));if(browseIndex<0&&stagger&&focusIndex<=index)next=std::min(next,std::max(1.,lines[index+1].time-time-200));}
-  if(playing&&valid&&!untimed)for(const auto&item:groups){const auto&g=item.second;if(!groupVisible(g,motionNow())||staticInterlude(g))continue;const auto&line=g.model;
+  if(playing&&valid&&!untimed)for(const auto&item:groups){const auto&g=item.second;if(!groupVisible(g,motionNow()))continue;const auto&line=g.content->model;
    if(indicatorVisible(g))active=true;
    if(g.active)for(const auto&word:line.words){if(time>=word.time&&time<word.time+word.duration+150)active=true;else if(word.time>time)next=std::min(next,word.time-time);}
-   if(canScroll(item.first)&&((g.glyphs.empty()&&rowWidth(g)*g.zoom.value(motionNow())>width-textX-12)||(g.translated&&g.subtitle.width*g.zoom.value(motionNow())>width-textX-12))){double begin=line.time+900,end=begin+std::max(1200.,(line.duration>0?line.duration:4000)-1600);if(time<begin)next=std::min(next,begin-time);else if(time<end)active=true;}
+   if(canScroll(item.first)&&((g.content->glyphs.empty()&&rowWidth(g)*g.zoom.value(motionNow())>width-textX-12)||(g.translated&&g.content->subtitle.width*g.zoom.value(motionNow())>width-textX-12))){double begin=line.time+900,end=begin+std::max(1200.,(line.duration>0?line.duration:4000)-1600);if(time<begin)next=std::min(next,begin-time);else if(time<end)active=true;}
   }
   bool flying=!flight.rows.empty(),coverAnimating=coverSince>=0&&nowMs()-coverSince<250;active=active||coverAnimating||flying;
   bool backgroundActive=backgroundAnimating();bool run=flying||manualTransition||(playing&&valid&&((!untimed&&!lines.empty())||hover||coverAnimating||backgroundActive));double wanted=active?1000./(fps==60?60:30):std::max(1.,next);if(backgroundActive)wanted=std::min(wanted,1000./background.fps);
@@ -543,7 +609,15 @@ class App {
   if(snapRow||(!playing&&browseIndex<0&&actualChanged))for(auto&item:groups){auto&g=item.second;g.mainAlpha.snap(g.mainAlpha.to);g.subAlpha.snap(g.subAlpha.to);if(snapRow)g.resetWords.clear();}
   snapRow=false;returnFromBrowse=false;transitionActive=false;double now=motionNow();
   updateIndicators();
-  if(lyricView()==LyricView::Rows)for(auto&item:groups){auto&g=item.second;bool stationary=staticInterlude(g);if((browseIndex>=0&&isInterlude(g)&&!stationary)||(emptyGroup(g)&&!indicatorVisible(g)&&!stationary))continue;bool visible=groupVisible(g,now);bool crosses=std::min(g.y.from,g.y.to)<=viewportBottom&&std::max(g.y.from,g.y.to)+g.renderedHeight(std::max(g.zoom.from,g.zoom.to))>=viewportTop;transitionActive=transitionActive||(g.y.active(now)&&crosses)||(visible&&(g.zoom.active(now)||(!stationary&&(g.mainAlpha.active(now)||g.subAlpha.active(now)||(!g.active&&!g.resetWords.empty()&&now-g.resetAt<200)))));}
+  if(lyricView()==LyricView::Rows)for(const auto&item:groups){
+   const auto&g=item.second;
+   bool hasContent=!emptyGroup(g)||indicatorVisible(g);
+   if(!hasContent&&!g.middleInterlude)continue;
+   bool visible=groupVisible(g,now);
+   bool crosses=std::min(g.y.from,g.y.to)<=viewportBottom&&std::max(g.y.from,g.y.to)+g.renderedHeight(std::max(g.zoom.from,g.zoom.to))>=viewportTop;
+   bool contentAnimating=hasContent&&(g.mainAlpha.active(now)||g.subAlpha.active(now)||(!g.active&&!g.resetWords.empty()&&now-g.resetAt<200));
+   transitionActive=transitionActive||(g.y.active(now)&&crosses)||(visible&&(g.zoom.active(now)||contentAnimating));
+  }
   bool layoutActive=false;for(const auto&item:groups){const auto&g=item.second;layoutActive=layoutActive||g.y.active(now)||g.zoom.active(now);}
   manualTransition=manualTransition&&layoutActive;manualLayoutPending=false;
   motion.setRunning(renderVisible&&((valid&&!untimed&&playing)||manualTransition),animationWall());
@@ -565,7 +639,7 @@ class App {
   if(type=="background-state")j["background"]=backgroundState();return j;
  }
  Json diagnostics(const std::string&type,bool accepted=true){Json j=state(type,accepted);j["currentLineIndex"]=index;j["index"]=index;j["frameRunning"]=frameRunning;j["intervalMs"]=int(intervalMs);j["renderCalls"]=double(renderCalls);j["lineBuildCalls"]=double(lineBuildCalls);j["backend"]="Direct2D/DirectWrite";j["hardware"]=hardware;j["renderVisible"]=renderVisible;j["through"]=through;j["top"]=top;j["windowTopmost"]=(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_TOPMOST)!=0;j["windowNoActivate"]=(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_NOACTIVATE)!=0;j["fps"]=fps;j["fontSize"]=currentFontSize;j["systemMoving"]=systemMoving;j["frameScheduler"]=frameTimer&&(!systemMoving||modalFrames.active())?(systemMoving?"waitable-posted":"waitable-deadline"):"window-timer";j["coverLoaded"]=!cover.pixels.empty();j["dpi"]=double(dpi);j["coverLeftPx"]=std::round(artBounds.left*scale());j["coverTopPx"]=std::round(artBounds.top*scale());j["coverSidePx"]=std::round(artSize*scale());j["coverRadiusPx"]=std::round(artRadius*scale());j["windowHeightPx"]=std::round(height*scale());j["iconBackend"]="vector";j["windowWidthPx"]=std::round(width*scale());j["barLeftPx"]=transport.left*scale();j["barRightPx"]=transport.right*scale();j["controlYPx"]=transport.y*scale();j["previousPx"]=transport.previous*scale();j["playPx"]=transport.play*scale();j["nextPx"]=transport.next*scale();j["rowStartedMs"]=rowSince;j["focusIndex"]=focusIndex;j["browsing"]=browseIndex>=0;j["browseIndex"]=browseIndex;j["browseRemainingMs"]=browseIndex>=0?std::max(0.,browseUntil-animationWall()):0;j["groupCacheLimit"]=32;j["transitionActive"]=transitionActive;j["transitionProgress"]=unit((motionNow()-rowSince-200)/500);j["transitionMode"]=transitionActive?"group-scroll":"none";j["animationTimeMs"]=motionNow();j["retainedRows"]=int(groups.size());j["layoutChanges"]=double(layoutChanges);j["lookaheadMs"]=stagger?200:0;j["stagger"]=stagger;j["curve"]=lineCurve;j["viewportTop"]=viewportTop;j["viewportBottom"]=viewportBottom;j["groupGap"]=GroupGap;j["layoutAnchor"]=layoutAnchor;j["groups"].kind=Json::Array;
-  for(const auto&item:groups){const auto&g=item.second;Json v=Json::obj();v["index"]=item.first;v["identity"]=double(g.identity);v["text"]=narrow(g.model.text);v["translation"]=g.translated?narrow(g.model.translation):"";v["top"]=g.y.value(motionNow());v["target"]=g.y.to;v["startAt"]=g.y.start;v["durationMs"]=g.y.duration;v["height"]=g.renderedHeight(1.f);v["scale"]=g.zoom.value(motionNow());v["scaleTarget"]=g.zoom.to;v["scaleStartAt"]=g.zoom.start;v["scaleDurationMs"]=g.zoom.duration;v["renderedHeight"]=g.renderedHeight(g.zoom.value(motionNow()));v["fontSize"]=currentFontSize*g.zoom.value(motionNow());v["translationFontSize"]=g.translated?translationFontSize*g.zoom.value(motionNow()):0.f;v["rendered"]=groupVisible(g,motionNow());v["mainHeight"]=g.mainHeight;v["subOffset"]=g.subtitleOffset(g.zoom.value(motionNow()));v["mainAlpha"]=g.mainAlpha.value(motionNow());v["subAlpha"]=g.subAlpha.value(motionNow());v["active"]=g.active;j["groups"].array.push_back(std::move(v));}
+  for(const auto&item:groups){const auto&g=item.second;Json v=Json::obj();v["index"]=item.first;v["identity"]=double(g.identity);v["text"]=narrow(g.content->model.text);v["translation"]=g.translated?narrow(g.content->model.translation):"";v["top"]=g.y.value(motionNow());v["target"]=g.y.to;v["startAt"]=g.y.start;v["durationMs"]=g.y.duration;v["height"]=g.renderedHeight(1.f);v["scale"]=g.zoom.value(motionNow());v["scaleTarget"]=g.zoom.to;v["scaleStartAt"]=g.zoom.start;v["scaleDurationMs"]=g.zoom.duration;v["renderedHeight"]=g.renderedHeight(g.zoom.value(motionNow()));v["fontSize"]=currentFontSize*g.zoom.value(motionNow());v["translationFontSize"]=g.translated?translationFontSize*g.zoom.value(motionNow()):0.f;v["rendered"]=groupVisible(g,motionNow());v["mainHeight"]=g.content->mainHeight;v["subOffset"]=g.subtitleOffset(g.zoom.value(motionNow()));v["mainAlpha"]=g.mainAlpha.value(motionNow());v["subAlpha"]=g.subAlpha.value(motionNow());v["active"]=g.active;j["groups"].array.push_back(std::move(v));}
   j["seekFlight"]=!flight.rows.empty();if(!flight.rows.empty()){j["transitionMode"]="seek-flight";j["transitionActive"]=true;j["transitionProgress"]=unit((animationWall()-flight.started)/(500+(flight.stagger?400:0)));}j["background"]=backgroundState();j["backgroundAnimating"]=backgroundAnimating();j["backgroundFrameBuilds"]=double(fluid.revision);j["backgroundBackend"]=fluid.backend();j["backgroundGpuReady"]=fluid.gpuReady();j["backgroundGpuError"]=fluid.gpuError;j["backgroundTimeMs"]=backgroundClock.time(animationWall());j["first"]=index>=0&&index<int(lines.size())?narrow(lines[index].text):"";j["second"]=index>=0&&index<int(lines.size())?(translation&&!lines[index].translation.empty()?narrow(lines[index].translation):index+1<int(lines.size())?narrow(lines[index+1].text):""):"";return j;}
  void report(const std::string&type,bool accepted=true,bool detailed=false){if(bridge)bridge->send(detailed?diagnostics(type,accepted):state(type,accepted));}
  void command(const std::string&action,double pos=0){if(!bridge)return;Json j=Json::obj();j["type"]="command";j["action"]=action;j["position"]=pos;if(action=="seek"){j["requestId"]=double(seekRequest);j["songId"]=songId;}bridge->send(j);}
@@ -619,7 +693,15 @@ class App {
  void receive(const Json&m){
   received=nowMs();auto type=m["type"].s();
   if(type=="ping"){if(connectionStale||error=="disconnected"){connectionStale=false;if(error=="disconnected")error.clear();update();}}
-  else if(type=="track"){auto id=m["id"].s();if(id!=songId){flight=LyricFlight();stopBrowsing();songId=id;groups.clear();focusIndex=-999;layoutDirty=true;snapRow=true;cancelSeek();seekRequest=0;lines.clear();lyricsReceived=false;untimed=false;hasClock=false;updatePlaceholders();index=-999;position=0;revision=0;valid=false;error.clear();}title=widen(m["title"].s());artist=widen(m["artist"].s());duration=std::max(0.,m["duration"].n());rebuildMeta();auto cover=widen(m["cover"].s());if(cover!=coverUrl)loadCover(cover);update();}
+  else if(type=="track"){
+   auto id=m["id"].s();
+   if(id!=songId){
+    KillTimer(hwnd,LayoutWarmupTimer);nextLayoutToWarm=0;
+    flight=LyricFlight();stopBrowsing();songId=id;groups.clear();lyricLayouts.clear();
+    focusIndex=-999;layoutDirty=true;snapRow=true;cancelSeek();seekRequest=0;lines.clear();lyricsReceived=false;untimed=false;hasClock=false;updatePlaceholders();index=-999;position=0;revision=0;valid=false;error.clear();
+   }
+   title=widen(m["title"].s());artist=widen(m["artist"].s());duration=std::max(0.,m["duration"].n());rebuildMeta();auto cover=widen(m["cover"].s());if(cover!=coverUrl)loadCover(cover);update();
+  }
   else if(type=="lyrics"){
    if(m["songId"].s()!=songId){error="song-mismatch";report("lyrics-ack",false);return;}
    std::vector<Line> next;for(const auto&raw:m["lines"].array){if(next.size()>=5000)break;if(raw.kind!=Json::Object)continue;Line line;line.time=std::max(0.,raw["time"].n());line.duration=std::max(0.,raw["duration"].n());line.text=widen(raw["text"].s());line.isInterlude=raw["isInterlude"].b();line.translation=widen(raw["translation"].s());for(const auto&w:raw["words"].array){if(line.words.size()>=500)break;if(w.kind!=Json::Object)continue;line.words.push_back({widen(w["text"].s()),w["time"].n(),std::max(1.,w["duration"].n(1))});}if(line.text.empty())for(const auto&w:line.words)line.text+=w.text;next.push_back(std::move(line));}
@@ -627,9 +709,13 @@ class App {
    if(!nextUntimed)std::stable_sort(next.begin(),next.end(),[](const Line&a,const Line&b){return a.time<b.time;});
    bool contentChanged=next!=lines||nextUntimed!=untimed;
    if(contentChanged){if(nextUntimed!=untimed){stopBrowsing();focusIndex=-999;snapRow=true;}untimed=nextUntimed;bool same=index>=0&&index<int(lines.size())&&index<int(next.size())&&lines[index].time==next[index].time&&lines[index].text==next[index].text;
-    flight=LyricFlight();lines=std::move(next);layoutDirty=true;if(!same)snapRow=true;}
+    flight=LyricFlight();lines=std::move(next);layoutDirty=true;if(!same)snapRow=true;
+    lyricLayouts.resize(lines.size());
+    for(size_t i=0;i<lyricLayouts.size();++i)if(lyricLayouts[i]&&!(lyricLayouts[i]->model==lines[i]))lyricLayouts[i].reset();
+    nextLayoutToWarm=0;
+   }
    if(contentChanged||!wasReceived)updatePlaceholders();
-   revision=m["revision"].n();error.clear();update();report("lyrics-ack");
+   revision=m["revision"].n();error.clear();update();if(contentChanged)scheduleLayoutWarmup();report("lyrics-ack");
   }else if(type=="seek"){
    if(m["songId"].s()!=songId||m["position"].kind!=Json::Number||!std::isfinite(m["position"].n())||m["position"].n()<0)return;
    auto request=uint64_t(m["requestId"].n());if(request&&request!=seekRequest)return;
@@ -705,7 +791,7 @@ class App {
    case WM_WINDOWPOSCHANGED:{auto result=DefWindowProcW(hwnd,msg,wp,lp);setRenderVisible(IsWindowVisible(hwnd)&&!IsIconic(hwnd));return result;}
    case WM_SIZE:if(wp==SIZE_MINIMIZED){setRenderVisible(false);return 0;}if(wp!=SIZE_MAXHIDE&&wp!=SIZE_MAXSHOW&&factory&&textFactory&&hwnd&&geometry()){update();if(resizing&&renderVisible)UpdateWindow(hwnd);}return 0;
    case WM_DPICHANGED:{dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi,dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
-   case WM_TIMER:if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}return 0;
+   case WM_TIMER:if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();return 0;
    case WM_MOUSEWHEEL:{
     if(through||dragProgress||resizing||lines.empty())return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/scale(),y=p.y/scale();
     if(x<textX||x>width-12||y<viewportTop||y>viewportBottom)return 0;
@@ -736,7 +822,7 @@ class App {
      }return 0;
     }
     if(x<textX||y<32){ReleaseCapture();SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0);return 0;}
-    if(!untimed&&y>=viewportTop&&y<=viewportBottom&&x>=textX&&x<=width-12){for(const auto&item:groups){if(!groupVisible(item.second,motionNow()))continue;float top=item.second.y.value(motionNow());if(y>=top-2&&y<=top+item.second.renderedHeight(item.second.zoom.value(motionNow()))){requestSeek(std::max(0.,item.second.model.time-offset));update();break;}}}return 0;}
+    if(!untimed&&y>=viewportTop&&y<=viewportBottom&&x>=textX&&x<=width-12){for(const auto&item:groups){if(!groupVisible(item.second,motionNow()))continue;float top=item.second.y.value(motionNow());if(y>=top-2&&y<=top+item.second.renderedHeight(item.second.zoom.value(motionNow()))){requestSeek(std::max(0.,item.second.content->model.time-offset));update();break;}}}return 0;}
    case WM_LBUTTONUP:if(dragProgress){requestSeek(duration*dragRatio);dragProgress=false;ReleaseCapture();update();}if(resizing)ReleaseCapture();return 0;
    case WM_LBUTTONDBLCLK:if(GET_X_LPARAM(lp)/scale()<textX)command("play");return 0;
    case WM_CAPTURECHANGED:{bool sized=resizing;dragProgress=false;resizing=false;POINT p;GetCursorPos(&p);ScreenToClient(hwnd,&p);hover=!through&&p.x>=0&&p.y>=0&&p.x<width*scale()&&p.y<height*scale();update();if(sized)save();return 0;}
@@ -744,7 +830,7 @@ class App {
    case WM_ENTERSIZEMOVE:stopFrames();if(frameTimer)WaitForSingleObject(frameTimer,0);systemMoving=true;modalFrames.start(hwnd,frameTimer,FrameReady);update();return 0;
    case WM_EXITSIZEMOVE:systemMoving=false;stopFrames();modalFrames.stop();recordNormalBounds();update();save();return 0;
    case WM_CLOSE:DestroyWindow(hwnd);return 0;
-   case WM_DESTROY:try{if(bridge)bridge->finish();}catch(...){}closing=true;systemMoving=false;stopFrames();modalFrames.stop();save();KillTimer(hwnd,1);KillTimer(hwnd,2);KillTimer(hwnd,3);KillTimer(hwnd,4);stopCoverWorker();PostQuitMessage(0);return 0;
+   case WM_DESTROY:try{if(bridge)bridge->finish();}catch(...){}closing=true;systemMoving=false;stopFrames();modalFrames.stop();save();KillTimer(hwnd,1);KillTimer(hwnd,2);KillTimer(hwnd,3);KillTimer(hwnd,4);KillTimer(hwnd,LayoutWarmupTimer);stopCoverWorker();PostQuitMessage(0);return 0;
   }return DefWindowProcW(hwnd,msg,wp,lp);
  }
  static LRESULT CALLBACK procedure(HWND window,UINT msg,WPARAM wp,LPARAM lp){App*app=reinterpret_cast<App*>(GetWindowLongPtrW(window,GWLP_USERDATA));if(msg==WM_NCCREATE){app=static_cast<App*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);app->hwnd=window;SetWindowLongPtrW(window,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(app));}if(app){try{return app->message(msg,wp,lp);}catch(...){app->error="window-message-failed";}}return DefWindowProcW(window,msg,wp,lp);}
