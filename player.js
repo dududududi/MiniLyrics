@@ -225,8 +225,37 @@
     function playbackControl(type,payload){
       cancelSeek(null,true);lastControl={action:type,route:'original-model',at:now()};return dispatch(type,payload);
     }
+    function playlistEntries(){
+      if(disposed||!store)return null;
+      let state;try{state=store.getState();}catch{return null;}
+      const list=state?.playingList?.curPlayingList;
+      if(!Array.isArray(list))return null;
+      const playing=state?.playing,currentId=String(playing?.curPlaying?.resourceId??playing?.curPlaying?.trackId??playing?.resourceTrackId??'');
+      const entries=[];
+      for(let index=0;index<list.length;index++){
+        const item=list[index];if(!item)continue;
+        const track=item.track&&(item.track.name!=null||item.track.id!=null)?item.track:(item.localTrack?.origin??item.localTrack??{});
+        const artists=Array.isArray(track?.artists)?track.artists.map(a=>a?.name??'').filter(Boolean).join(' / '):(item.track?.creator?.nickname??'');
+        const resourceId=String(item.resourceId??item.trackId??track?.id??'');
+        entries.push({index,resourceId,title:String(track?.name??item.text??''),artist:artists,
+          duration:Math.max(0,Number(track?.duration)||0),current:!!currentId&&resourceId===currentId});
+      }
+      return entries;
+    }
+    function playPlaylistIndex(index,resourceId=''){
+      if(disposed||!store||!Number.isInteger(index)||index<0)return false;
+      let list;try{list=store.getState()?.playingList?.curPlayingList;}catch{return false;}
+      if(!Array.isArray(list)||index>=list.length)return false;
+      let position=index;
+      if(resourceId){const found=list.findIndex(item=>String(item?.resourceId??item?.trackId??'')===String(resourceId));if(found>=0)position=found;}
+      const item=list[position];if(!item)return false;
+      lastControl={action:'select',route:'original-model',index:position,at:now()};
+      try{return dispatch('playing/playOneTrackInPlayingList',{item,switchType:'call',flag:0,triggerScene:'playingList'});}
+      catch(e){lastControl.error='select-dispatch-failed';env.console?.warn('[MiniLyrics] 切换歌曲失败',e);return false;}
+    }
     const api={version:'ncm3-v3',get ready(){return !!store&&!disposed;},getDiagnostics:diagnostics,
       getCurrentSong:()=>{sync();return song;},getPlaybackStatus:()=>status,getTimeline:()=>{bindEvents();scheduleStartupSeek();return timeline;},
+      getPlaylist:playlistEntries,playPlaylistIndex,
       addEventListener:(name,fn)=>{if(!events.has(name))events.set(name,new Set());events.get(name).add(fn);},
       removeEventListener:(name,fn)=>events.get(name)?.delete(fn),
       play:()=>playbackControl('playing/resume',{triggerScene:'desktopLyric'}),pause:()=>playbackControl('playing/pause',{triggerScene:'desktopLyric'}),
