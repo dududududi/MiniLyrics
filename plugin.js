@@ -179,6 +179,11 @@
     if(m.action==='play'){if(player?.togglePlay)player.togglePlay();else player?.[player.getPlaybackStatus?.()==='Playing'?'pause':'play']?.();return;}
     if(m.action==='previous'||m.action==='next')player?.[m.action]?.();
     if(m.action==='playlist')return requestPlaylist();
+    if(m.action==='detail'){
+      if(!player)return;
+      if(player.openVinylPage?.()!==true)send({type:'nowplaying',open:!!player.isVinylPageOpen?.()});
+      return;
+    }
     if(m.action==='select'){
       const index=Number(m.index);
       if(!Number.isInteger(index))return;
@@ -203,7 +208,8 @@
       if(!sample(undefined,e.detail)){playing=playback.current();sendClock(pendingSeek?'pending':'');}
     };
     const onControlError=e=>{const own=pendingSeek;if(player===api&&own&&e.detail?.requestId===own.id&&e.detail?.songId===own.songId)failSeek(own,e.detail.reason);};
-    const bindings=[['timelineUpdate',onTimeline],['songChange',onSong],['playStateChange',onPlaying],['controlError',onControlError]];
+    const onVinyl=e=>{if(player===api)send({type:'nowplaying',open:!!e.detail?.open});};
+    const bindings=[['timelineUpdate',onTimeline],['songChange',onSong],['playStateChange',onPlaying],['controlError',onControlError],['vinylPageChange',onVinyl]];
     for(const [name,fn]of bindings)api.addEventListener?.(name,fn);
     detachPlayer=()=>{for(const [name,fn]of bindings)api.removeEventListener?.(name,fn);};
     status='已连接';
