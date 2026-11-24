@@ -31,6 +31,32 @@
   }catch{background=normalizeBackground();}
   function sendBackground(){send({type:'background',...background});}
   function changeBackground(patch){background=normalizeBackground({...background,...patch});try{plugin.setConfig?.('background',{...background});}catch(e){console.warn('[MiniLyrics] 背景设置保存失败',e);}sendBackground();}
+  let playlistRevision=0,playlistSignature='',playlistRetry=null;
+  function sendPlaylist(force=false){
+    let list;try{list=player?.getPlaylist?.();}catch{list=null;}
+    if(!Array.isArray(list))return false;
+    const currentIndex=list.findIndex(entry=>entry.current);
+    const signature=list.length+'|'+(list[0]?.resourceId??'')+'|'+(list[list.length-1]?.resourceId??'')+'|'+currentIndex;
+    if(!force&&signature===playlistSignature)return true;
+    playlistSignature=signature;
+    const MAX=4000;let entries=list,offset=0;
+    if(list.length>MAX){
+      const center=Math.max(0,currentIndex),start=Math.max(0,Math.min(list.length-MAX,center-Math.floor(MAX/2)));
+      entries=list.slice(start,start+MAX);offset=start;
+    }
+    send({type:'playlist',revision:++playlistRevision,current:currentIndex,
+      items:entries.map((entry,i)=>({index:Number.isInteger(entry.index)?entry.index:offset+i,
+        resourceId:String(entry.resourceId??''),title:String(entry.title??''),artist:String(entry.artist??''),
+        duration:Number(entry.duration)||0,current:!!entry.current}))});
+    return true;
+  }
+  function requestPlaylist(){
+    if(sendPlaylist(true))return;
+    if(player&&typeof player.getPlaylist!=='function'){send({type:'playlist',revision:++playlistRevision,current:-1,unsupported:true,items:[]});return;}
+    // Player not attached yet: retry silently; host re-requests while the panel is open.
+    clearTimeout(playlistRetry);
+    playlistRetry=setTimeout(()=>{if(!stopped&&socket?.readyState===1)sendPlaylist(true);},700);
+  }
   const listen=(target,name,fn)=>{target.addEventListener(name,fn);listeners.push([target,name,fn]);};
   const send=m=>{if(socket?.readyState!==1)return;try{socket.send(JSON.stringify(m,(_,v)=>typeof v==='string'?C.wellFormed(v):v));}catch(e){console.debug('[MiniLyrics] 小窗消息发送失败',e);socket?.close();}};
   const live=()=>position+(playing&&clockValid?Math.max(0,performance.now()-anchor):0);
@@ -152,6 +178,12 @@
     if(m.action==='seek')return seek(m.position,m.requestId,m.songId);
     if(m.action==='play'){if(player?.togglePlay)player.togglePlay();else player?.[player.getPlaybackStatus?.()==='Playing'?'pause':'play']?.();return;}
     if(m.action==='previous'||m.action==='next')player?.[m.action]?.();
+    if(m.action==='playlist')return requestPlaylist();
+    if(m.action==='select'){
+      const index=Number(m.index);
+      if(!Number.isInteger(index))return;
+      if(player?.playPlaylistIndex?.(index,m.resourceId??'')!==false){playlistSignature='';clearTimeout(playlistRetry);playlistRetry=setTimeout(()=>{if(!stopped&&socket?.readyState===1)sendPlaylist(true);},220);}
+    }
   }
   function attachPlayer(){
     const candidate=(playerAdapter.ready?playerAdapter:null),api=typeof candidate?.getCurrentSong==='function'&&typeof candidate?.getTimeline==='function'?candidate:null;
@@ -331,6 +363,7 @@
     // Page reload/unload is temporary bridge loss, not a user close request.
     if(windowSession)rememberWindow(windowSession);
     stopped=true;session++;busy=false;clearTimeout(reconnectTimer);reconnectTimer=null;
+    clearTimeout(playlistRetry);playlistRetry=null;
     const previous=socket;socket=null;releaseConnection();previous?.close();
     for(const [target,name,fn]of listeners)target.removeEventListener?.(name,fn);
     playerAdapter.dispose();
