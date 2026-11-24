@@ -33,7 +33,7 @@ template<class T> class Com {
  T* get()const{return p;}T*operator->()const{return p;}explicit operator bool()const{return p!=nullptr;}
  T**put(){reset();return &p;}void reset(){if(p){p->Release();p=nullptr;}}
 };
-static constexpr double MinWindowHeight=130;
+static constexpr double MinWindowWidth=360,MaxWindowWidth=1200,MinWindowHeight=130,MaxWindowHeight=600;
 static constexpr float CurrentFontSize=21,ContextFontSize=16,TranslationFontSize=16,GroupGap=7,TranslationGap=6.3f;
 static double nowMs(){static auto origin=std::chrono::steady_clock::now();return std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-origin).count();}
 static double clamp(double x,double lo,double hi){return std::max(lo,std::min(hi,std::isfinite(x)?x:lo));}
@@ -839,7 +839,7 @@ class App {
    g.brush->SetColor(D2D1::ColorF(1,1,1));x=width-42;t->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x-4,18,x+4,25),1,1),g.brush.get(),1);t->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x,17),3,4),g.brush.get(),1);
    x=width-18;t->DrawLine(D2D1::Point2F(x-3,16),D2D1::Point2F(x+3,22),g.brush.get(),1.5f);t->DrawLine(D2D1::Point2F(x+3,16),D2D1::Point2F(x-3,22),g.brush.get(),1.5f);
   }
-  g.brush->SetColor(D2D1::ColorF(1,1,1,.2f));t->DrawLine(D2D1::Point2F(width-12,height-3),D2D1::Point2F(width-3,height-12),g.brush.get(),1);
+  if(!through){g.brush->SetColor(D2D1::ColorF(1,1,1,hover?.5f:.2f));for(int line=1;line<=3;line++){float d=3.f+line*4.5f;t->DrawLine(D2D1::Point2F(width-d,height-3),D2D1::Point2F(width-3,height-d),g.brush.get(),1);}}
  }
  void stopFrames(){if(frameRunning||frameArmed){KillTimer(hwnd,1);if(frameTimer)CancelWaitableTimer(frameTimer);}frameArmed=false;frameRunning=false;frameDeadline=0;}
  void setRenderVisible(bool visible){
@@ -1066,7 +1066,7 @@ class App {
   else if(type=="test-settings"&&!capturePath.empty()){
    if(m["motionWall"].kind==Json::Number){testWall=true;testWallMs=m["motionWall"].n();}
    if(m["freezeClock"].kind==Json::Bool)freezePlayback=m["freezeClock"].b();
-   if(m["width"].kind==Json::Number&&m["height"].kind==Json::Number)SetWindowPos(hwnd,nullptr,0,0,int(clamp(m["width"].n(),360,900)*scale()),int(clamp(m["height"].n(),MinWindowHeight,240)*scale()),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+   if(m["width"].kind==Json::Number&&m["height"].kind==Json::Number)SetWindowPos(hwnd,nullptr,0,0,int(clamp(m["width"].n(),MinWindowWidth,MaxWindowWidth)*scale()),int(clamp(m["height"].n(),MinWindowHeight,MaxWindowHeight)*scale()),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
    if(m["hover"].kind==Json::Bool)hover=m["hover"].b();
    if(m["translation"].kind==Json::Bool&&translation!=m["translation"].b()){translation=m["translation"].b();layoutDirty=true;}
    if(m["through"].kind==Json::Bool)setThrough(m["through"].b());
@@ -1106,7 +1106,7 @@ class App {
    case BridgeDisconnected:if(!closing&&bridge&&!bridge->connected())freezeConnection();return 0;
    case CoverReady:{std::unique_ptr<CoverData> value(reinterpret_cast<CoverData*>(lp));onCover(std::move(value));return 0;}
    case FrameReady:if(systemMoving&&modalFrames.accepts(wp)&&frameArmed&&nowMs()+1>=frameDeadline){frameArmed=false;update();if(renderVisible)UpdateWindow(hwnd);}return 0;
-   case WM_GETMINMAXINFO:{auto*limits=reinterpret_cast<MINMAXINFO*>(lp);limits->ptMinTrackSize.x=LONG(std::ceil(360.f*scale()));limits->ptMinTrackSize.y=LONG(std::ceil(MinWindowHeight*scale()));return 0;}
+   case WM_GETMINMAXINFO:{auto*limits=reinterpret_cast<MINMAXINFO*>(lp);limits->ptMinTrackSize.x=LONG(std::ceil(MinWindowWidth*scale()));limits->ptMinTrackSize.y=LONG(std::ceil(MinWindowHeight*scale()));return 0;}
    case WM_WINDOWPOSCHANGED:{auto result=DefWindowProcW(hwnd,msg,wp,lp);setRenderVisible(IsWindowVisible(hwnd)&&!IsIconic(hwnd));if(playlistOpen)positionPlaylist();return result;}
    case WM_SIZE:if(wp==SIZE_MINIMIZED){closePlaylist();setRenderVisible(false);return 0;}if(wp!=SIZE_MAXHIDE&&wp!=SIZE_MAXSHOW&&factory&&textFactory&&hwnd&&geometry()){if(playlistOpen)closePlaylist();update();if(resizing&&renderVisible)UpdateWindow(hwnd);}return 0;
    case WM_DPICHANGED:{closePlaylist();dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
@@ -1131,7 +1131,7 @@ class App {
     }
     break;
    }
-   case WM_MOUSEMOVE:{float x=GET_X_LPARAM(lp)/scale();if(resizing){POINT point;GetCursorPos(&point);int w=int(clamp(resizeSize.cx+point.x-resizeStart.x,360*scale(),900*scale())),h=int(clamp(resizeSize.cy+point.y-resizeStart.y,MinWindowHeight*scale(),240*scale()));if(w!=geometryPixels.cx||h!=geometryPixels.cy)SetWindowPos(hwnd,nullptr,0,0,w,h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);}else if(dragProgress){dragRatio=transport.ratio(x);update();}else if(!hover&&!through){hover=true;TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,hwnd,0};TrackMouseEvent(&event);update();}return 0;}
+   case WM_MOUSEMOVE:{float x=GET_X_LPARAM(lp)/scale();if(resizing){POINT point;GetCursorPos(&point);int w=int(clamp(resizeSize.cx+point.x-resizeStart.x,MinWindowWidth*scale(),MaxWindowWidth*scale())),h=int(clamp(resizeSize.cy+point.y-resizeStart.y,MinWindowHeight*scale(),MaxWindowHeight*scale()));if(w!=geometryPixels.cx||h!=geometryPixels.cy)SetWindowPos(hwnd,nullptr,0,0,w,h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);}else if(dragProgress){dragRatio=transport.ratio(x);update();}else if(!hover&&!through){hover=true;TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,hwnd,0};TrackMouseEvent(&event);update();}return 0;}
    case WM_MOUSELEAVE:if(!dragProgress&&!resizing){hover=false;update();}return 0;
    case WM_LBUTTONDOWN:{if(through)return 0;float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();bool iconZone=hover&&y<32&&x>width-102;if(playlistOpen&&!iconZone&&!(x>width-17&&y>height-17))closePlaylist();if(x>width-17&&y>height-17){resizing=true;GetCursorPos(&resizeStart);RECT r;GetWindowRect(hwnd,&r);resizeSize={r.right-r.left,r.bottom-r.top};SetCapture(hwnd);update();return 0;}if(iconZone){int i=int((x-(width-102))/24);if(i==0){togglePlaylist();}else if(i==1){setTop(!top);save();update();}else if(i==2){setThrough(true);update();}else DestroyWindow(hwnd);return 0;}
     if(hover&&y>=transport.y-14){
@@ -1156,7 +1156,7 @@ class App {
  public:
  ~App(){stopCoverWorker();}
  App(){settingsPath=env(L"MINILYRICS_SETTINGS");if(settingsPath.empty())settingsPath=env(L"LOCALAPPDATA")+L"\\MiniLyrics\\settings.json";
-  try{std::ifstream f(std::filesystem::path(settingsPath),std::ios::binary);std::string bytes((std::istreambuf_iterator<char>(f)),{});if(bytes.size()>65536)throw std::runtime_error("settings size");auto settings=JsonParser(bytes).parse();savedX=settings["X"].n(80);savedY=settings["Y"].n(80);positionInPixels=settings["PositionInPixels"].b();savedWidth=clamp(settings["Width"].n(360),360,900);savedHeight=clamp(settings["Height"].n(130),MinWindowHeight,240);top=settings["Top"].b(true);translation=settings["Translation"].b(true);fps=settings["Fps"].n(60)==60?60:30;readBackground(settings["Background"]);currentFontSize=float(std::round(clamp(settings["FontSize"].n(::CurrentFontSize),14,36)));contextFontSize=::ContextFontSize*currentFontSize/::CurrentFontSize;translationFontSize=::TranslationFontSize*currentFontSize/::CurrentFontSize;}catch(...){}
+  try{std::ifstream f(std::filesystem::path(settingsPath),std::ios::binary);std::string bytes((std::istreambuf_iterator<char>(f)),{});if(bytes.size()>65536)throw std::runtime_error("settings size");auto settings=JsonParser(bytes).parse();savedX=settings["X"].n(80);savedY=settings["Y"].n(80);positionInPixels=settings["PositionInPixels"].b();savedWidth=clamp(settings["Width"].n(MinWindowWidth),MinWindowWidth,MaxWindowWidth);savedHeight=clamp(settings["Height"].n(MinWindowHeight),MinWindowHeight,MaxWindowHeight);top=settings["Top"].b(true);translation=settings["Translation"].b(true);fps=settings["Fps"].n(60)==60?60:30;readBackground(settings["Background"]);currentFontSize=float(std::round(clamp(settings["FontSize"].n(::CurrentFontSize),14,36)));contextFontSize=::ContextFontSize*currentFontSize/::CurrentFontSize;translationFontSize=::TranslationFontSize*currentFontSize/::CurrentFontSize;}catch(...){}
  }
  int run(HINSTANCE instance,int port,const std::string&token,const std::wstring&captureFile,bool demoMode){
   capturePath=captureFile;demo=demoMode;if(!demo)ownerProcess.capture();check(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,factory.put()));check(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(textFactory.put())));check(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(imaging.put())));
