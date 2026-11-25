@@ -140,6 +140,70 @@ struct Graphics {
  }
 };
 
+class LayeredSurface {
+ Com<ID2D1DCRenderTarget> render;
+ HDC memory=nullptr,screen=nullptr;
+ HBITMAP bitmap=nullptr;
+ HGDIOBJ original=nullptr;
+ UINT pixelWidth=0,pixelHeight=0;
+ void release(){
+  render.reset();
+  if(memory){
+   if(bitmap){if(original)SelectObject(memory,original);DeleteObject(bitmap);bitmap=nullptr;}
+   DeleteDC(memory);memory=nullptr;
+  }
+  if(screen){ReleaseDC(nullptr,screen);screen=nullptr;}
+  original=nullptr;pixelWidth=pixelHeight=0;
+ }
+ public:
+ LayeredSurface()=default;
+ LayeredSurface(const LayeredSurface&)=delete;LayeredSurface&operator=(const LayeredSurface&)=delete;
+ ~LayeredSurface(){release();}
+ ID2D1DCRenderTarget*get()const{return render.get();}
+ ID2D1DCRenderTarget*operator->()const{return render.get();}
+ explicit operator bool()const{return bool(render);}
+ D2D1_SIZE_U GetPixelSize()const{return D2D1::SizeU(pixelWidth,pixelHeight);}
+ void GetDpi(FLOAT*x,FLOAT*y)const{render->GetDpi(x,y);}
+ void SetDpi(float value)const{if(render)render->SetDpi(value,value);}
+ void SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE mode)const{if(render)render->SetTextAntialiasMode(mode);}
+ void BeginDraw()const{render->BeginDraw();}
+ HRESULT EndDraw()const{return render->EndDraw();}
+ void reset(){release();}
+ bool create(ID2D1Factory*factory,float dpi,bool&hardware){
+  for(int pass=0;pass<2;pass++){
+   D2D1_RENDER_TARGET_PROPERTIES props=D2D1::RenderTargetProperties(pass?D2D1_RENDER_TARGET_TYPE_SOFTWARE:D2D1_RENDER_TARGET_TYPE_HARDWARE,
+    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),dpi,dpi);
+   Com<ID2D1DCRenderTarget> next;
+   if(SUCCEEDED(factory->CreateDCRenderTarget(&props,next.put()))){render=std::move(next);hardware=pass==0;return true;}
+  }
+  return false;
+ }
+ bool bind(UINT w,UINT h){
+  if(!render)return false;
+  if(!memory){memory=CreateCompatibleDC(nullptr);if(!memory)return false;}
+  if(bitmap&&pixelWidth==w&&pixelHeight==h)return true;
+  BITMAPINFO info{};
+  info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=LONG(w);info.bmiHeader.biHeight=-LONG(h);
+  info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
+  void*bits=nullptr;HBITMAP next=CreateDIBSection(memory,&info,DIB_RGB_COLORS,&bits,nullptr,0);if(!next)return false;
+  HGDIOBJ previous=SelectObject(memory,next);
+  if(!original)original=previous;
+  if(bitmap&&previous==bitmap)DeleteObject(bitmap);
+  bitmap=next;pixelWidth=w;pixelHeight=h;
+  RECT area{0,0,LONG(w),LONG(h)};
+  return SUCCEEDED(render->BindDC(memory,&area));
+ }
+ bool present(HWND hwnd){
+  if(!render||!memory||!bitmap)return false;
+  RECT window{};if(!GetWindowRect(hwnd,&window))return false;
+  if(!screen){screen=GetDC(nullptr);if(!screen)return false;}
+  POINT destination{window.left,window.top},source{0,0};
+  SIZE size{LONG(pixelWidth),LONG(pixelHeight)};
+  BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
+  return UpdateLayeredWindow(hwnd,screen,&destination,&size,memory,&source,0,&blend,ULW_ALPHA)!=FALSE;
+ }
+};
+
 class App {
  friend struct NativeTest;
  float currentFontSize=::CurrentFontSize,contextFontSize=::ContextFontSize,translationFontSize=::TranslationFontSize;
@@ -1012,8 +1076,10 @@ class App {
   }
   else if(type=="nowplaying"){
    bool open=m["open"].b();
-   if(open&&vinylRequested)hideForVinyl();
-   else if(!open&&vinylHidden)showFromVinyl();
+   // The lyrics page may be opened by the app itself (for example RNP's own
+   // page); hide whenever it is open, not only for our own detail request.
+   if(open)hideForVinyl();
+   else if(vinylHidden)showFromVinyl();
   }
   else if(type=="font"){if(m["size"].kind==Json::Number)setLyricFontSize(m["size"].n());report("host-state");}
   else if(type=="background"){if(readBackground(m)){save();update();}report("background-state");}
@@ -1071,7 +1137,7 @@ class App {
    case WM_GETMINMAXINFO:{auto*limits=reinterpret_cast<MINMAXINFO*>(lp);limits->ptMinTrackSize.x=LONG(std::ceil(MinWindowWidth*scale()));limits->ptMinTrackSize.y=LONG(std::ceil(MinWindowHeight*scale()));return 0;}
    case WM_WINDOWPOSCHANGED:{auto result=DefWindowProcW(hwnd,msg,wp,lp);setRenderVisible(IsWindowVisible(hwnd)&&!IsIconic(hwnd));if(playlistOpen)positionPlaylist();return result;}
    case WM_SIZE:if(wp==SIZE_MINIMIZED){closePlaylist();setRenderVisible(false);return 0;}if(wp!=SIZE_MAXHIDE&&wp!=SIZE_MAXSHOW&&factory&&textFactory&&hwnd&&geometry()){if(playlistOpen)closePlaylist();update();if(resizing&&renderVisible)UpdateWindow(hwnd);}return 0;
-   case WM_DPICHANGED:{closePlaylist();dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
+   case WM_DPICHANGED:{closePlaylist();dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi,dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
    case WM_TIMER:if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();else if(wp==VinylConfirmTimer){vinylRequested=false;KillTimer(hwnd,VinylConfirmTimer);}else if(wp==PlaylistRefreshTimer){if(playlistOpen)command("playlist");else KillTimer(hwnd,PlaylistRefreshTimer);}return 0;
    case WM_MOUSEWHEEL:{
     if(through||dragProgress||resizing||lines.empty())return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/scale(),y=p.y/scale();
