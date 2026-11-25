@@ -181,7 +181,8 @@
     if(m.action==='playlist')return requestPlaylist();
     if(m.action==='detail'){
       if(!player)return;
-      if(player.openVinylPage?.()!==true)send({type:'nowplaying',open:!!player.isVinylPageOpen?.()});
+      if(player.isVinylPageOpen?.()){send({type:'nowplaying',open:true});return;}
+      if(player.openVinylPage?.()!==true)send({type:'nowplaying',open:false});
       return;
     }
     if(m.action==='select'){
