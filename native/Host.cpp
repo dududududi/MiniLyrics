@@ -140,6 +140,10 @@ struct Graphics {
  }
 };
 
+// Per-pixel-alpha layered presentation. A window region is a 1-bit mask, so
+// clipping a rounded card with SetWindowRgn staircases the corner and border.
+// Direct2D renders into a DIBSection instead and UpdateLayeredWindow composites
+// the premultiplied result, keeping every edge antialiased.
 class LayeredSurface {
  Com<ID2D1DCRenderTarget> render;
  HDC memory=nullptr,screen=nullptr;
@@ -212,7 +216,7 @@ class App {
  ModalFrames modalFrames;OwnerProcess ownerProcess;bool systemMoving=false,connectionStale=false;
  std::shared_ptr<CoverQueue> coverQueue;std::thread coverWorker;
  Com<ID2D1Factory> factory;Com<IDWriteFactory> textFactory;Com<IWICImagingFactory> imaging;
- Com<ID2D1HwndRenderTarget> target;Graphics graphics;Com<ID2D1RoundedRectangleGeometry> coverClip;
+ std::unique_ptr<LayeredSurface> target;Graphics graphics;Com<ID2D1RoundedRectangleGeometry> coverClip;
  Com<IDWriteTextFormat> mainFormat,secondaryFormat,metaFormat;
  Layout metaLayout,placeholder;int preludePreview=-1;std::map<int,LyricGroup>groups;InterludeAnimation preludeDots;LyricFlight flight;float secondaryRowHeight=0;
  std::vector<std::shared_ptr<LyricLayout>> lyricLayouts;
@@ -688,25 +692,25 @@ class App {
  bool geometry(){
   RECT rect{};GetClientRect(hwnd,&rect);
   if(geometryPixels.cx==rect.right&&geometryPixels.cy==rect.bottom&&geometryDpi==dpi)return false;
-  // Record this before SetWindowRgn, which sends nested window-position messages.
   geometryPixels={rect.right,rect.bottom};geometryDpi=dpi;flight=LyricFlight();recordNormalBounds();
   width=std::max(1.f,float(rect.right)/scale());height=std::max(1.f,float(rect.bottom)/scale());
   auto art=coverGeometry(rect.right,rect.bottom,scale());artSize=art.side;artRadius=art.radius;
   artBounds=D2D1::RectF(art.left,art.top,art.left+art.side,art.top+art.side);textX=artBounds.right+16;transport=transportGeometry(width,height,textX,scale());
   viewportTop=32;viewportBottom=std::min(height-28,transport.y-14);
   check(factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(artBounds,artRadius,artRadius),coverClip.put()));
-  HRGN region=CreateRoundRectRgn(0,0,rect.right+1,rect.bottom+1,int(34*scale()),int(34*scale()));if(!SetWindowRgn(hwnd,region,FALSE))DeleteObject(region);
   graphics.resize(width,height);rebuildMeta();layoutDirty=true;return true;
  }
  void ensureTarget(){
   RECT rect{};GetClientRect(hwnd,&rect);auto size=D2D1::SizeU(std::max(1L,rect.right),std::max(1L,rect.bottom));
-  // Resize discards the back buffer. Pair it with a full draw in the same paint.
-  if(target){auto old=target->GetPixelSize();if((old.width!=size.width||old.height!=size.height)&&FAILED(target->Resize(size))){graphics.clear();target.reset();}}
-  if(!target){auto props=D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_HARDWARE,D2D1::PixelFormat(DXGI_FORMAT_UNKNOWN,D2D1_ALPHA_MODE_UNKNOWN),dpi,dpi);
-   HRESULT hr=factory->CreateHwndRenderTarget(props,D2D1::HwndRenderTargetProperties(hwnd,D2D1::SizeU(std::max(1L,rect.right),std::max(1L,rect.bottom)),D2D1_PRESENT_OPTIONS_IMMEDIATELY),target.put());hardware=SUCCEEDED(hr);
-   if(FAILED(hr)){props.type=D2D1_RENDER_TARGET_TYPE_SOFTWARE;check(factory->CreateHwndRenderTarget(props,D2D1::HwndRenderTargetProperties(hwnd,D2D1::SizeU(std::max(1L,rect.right),std::max(1L,rect.bottom)),D2D1_PRESENT_OPTIONS_IMMEDIATELY),target.put()));}
-   target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-  }if(!graphics.target)graphics.init(target.get(),bgA,bgB,cover,width,height);
+  // UpdateLayeredWindow requires this style; isolated-test windows may lack it.
+  LONG_PTR style=GetWindowLongPtrW(hwnd,GWL_EXSTYLE);
+  if(!(style&WS_EX_LAYERED))SetWindowLongPtrW(hwnd,GWL_EXSTYLE,style|WS_EX_LAYERED);
+  // Resize discards the buffer. Pair the rebind with a full draw in this paint.
+  if(target){auto old=target->GetPixelSize();if((old.width!=size.width||old.height!=size.height)&&!target->bind(size.width,size.height)){graphics.clear();target.reset();}}
+  if(!target){auto next=std::make_unique<LayeredSurface>();
+   if(!next->create(factory.get(),dpi,hardware)||!next->bind(size.width,size.height))throw std::runtime_error("layered render target creation failed");
+   target=std::move(next);target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+  }if(!graphics.target)graphics.init(target->get(),bgA,bgB,cover,width,height);
  }
  void text(Graphics&g,const Layout&l,float x,float y,D2D1_COLOR_F color,float alpha=1){if(!l.value)return;g.brush->SetColor(color);g.brush->SetOpacity(alpha);g.target->DrawTextLayout(D2D1::Point2F(x,y),l.value.get(),g.brush.get(),D2D1_DRAW_TEXT_OPTIONS_NONE);g.brush->SetOpacity(1);}
  float rowWidth(const LyricGroup&g)const{return g.content->glyphs.empty()?g.content->main.width:g.content->glyphs.back().x+g.content->glyphs.back().layout.width;}
@@ -775,7 +779,7 @@ class App {
   if(background.mode==0){g.target->FillRoundedRectangle(card,g.gradient.get());return;}
   // Reuse the last texture while sizing; pending cover/settings changes and
   // the final dimensions are applied after mouse capture ends.
-  bool liveWindow=(g.target==target.get())&&backgroundAnimating()&&!resizing;
+  bool liveWindow=(target&&g.target==target->get())&&backgroundAnimating()&&!resizing;
   if(!resizing||fluid.pixels.empty()){double wall=animationWall();fluid.setSize(width,height);fluid.prepare(background,backgroundClock.time(wall),backgroundClock.position(wall),liveWindow);}
   if(!g.background){check(g.target->CreateBitmap(D2D1::SizeU(FluidBackground::width,FluidBackground::height),fluid.pixels.data(),FluidBackground::width*4,D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED)),g.background.put()));check(g.target->CreateBitmapBrush(g.background.get(),D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_CLAMP,D2D1_EXTEND_MODE_CLAMP,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR),g.backgroundBrush.put()));g.backgroundRevision=fluid.revision;}
   else if(g.backgroundRevision!=fluid.revision){check(g.background->CopyFromMemory(nullptr,fluid.pixels.data(),FluidBackground::width*4));g.backgroundRevision=fluid.revision;}
@@ -922,7 +926,7 @@ class App {
   motion.setRunning(renderVisible&&((valid&&!untimed&&playing)||manualTransition),animationWall());
   InvalidateRect(hwnd,nullptr,FALSE);schedule();
  }
- void paint(){PAINTSTRUCT ps{};BeginPaint(hwnd,&ps);if(renderVisible)try{ensureTarget();renderCalls++;target->BeginDraw();draw(graphics);HRESULT hr=target->EndDraw();if(hr==static_cast<HRESULT>(D2DERR_RECREATE_TARGET)){graphics.clear();target.reset();}else if(FAILED(hr))error="draw-failed";}catch(...){graphics.clear();target.reset();error="render-target-failed";}EndPaint(hwnd,&ps);}
+ void paint(){PAINTSTRUCT ps{};BeginPaint(hwnd,&ps);if(renderVisible)try{ensureTarget();renderCalls++;target->BeginDraw();draw(graphics);HRESULT hr=target->EndDraw();if(hr==static_cast<HRESULT>(D2DERR_RECREATE_TARGET)){graphics.clear();target.reset();}else if(FAILED(hr))error="draw-failed";else if(IsWindowVisible(hwnd)&&!target->present(hwnd))error="present-failed";}catch(...){graphics.clear();target.reset();error="render-target-failed";}EndPaint(hwnd,&ps);}
  void capture(){
   if(capturePath.empty())return;try{
    Com<IWICBitmap> bitmap;check(imaging->CreateBitmap(UINT(width*scale()),UINT(height*scale()),GUID_WICPixelFormat32bppPBGRA,WICBitmapCacheOnLoad,bitmap.put()));
@@ -1137,7 +1141,7 @@ class App {
    case WM_GETMINMAXINFO:{auto*limits=reinterpret_cast<MINMAXINFO*>(lp);limits->ptMinTrackSize.x=LONG(std::ceil(MinWindowWidth*scale()));limits->ptMinTrackSize.y=LONG(std::ceil(MinWindowHeight*scale()));return 0;}
    case WM_WINDOWPOSCHANGED:{auto result=DefWindowProcW(hwnd,msg,wp,lp);setRenderVisible(IsWindowVisible(hwnd)&&!IsIconic(hwnd));if(playlistOpen)positionPlaylist();return result;}
    case WM_SIZE:if(wp==SIZE_MINIMIZED){closePlaylist();setRenderVisible(false);return 0;}if(wp!=SIZE_MAXHIDE&&wp!=SIZE_MAXSHOW&&factory&&textFactory&&hwnd&&geometry()){if(playlistOpen)closePlaylist();update();if(resizing&&renderVisible)UpdateWindow(hwnd);}return 0;
-   case WM_DPICHANGED:{closePlaylist();dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi,dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
+   case WM_DPICHANGED:{closePlaylist();dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
    case WM_TIMER:if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();else if(wp==VinylConfirmTimer){vinylRequested=false;KillTimer(hwnd,VinylConfirmTimer);}else if(wp==PlaylistRefreshTimer){if(playlistOpen)command("playlist");else KillTimer(hwnd,PlaylistRefreshTimer);}return 0;
    case WM_MOUSEWHEEL:{
     if(through||dragProgress||resizing||lines.empty())return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/scale(),y=p.y/scale();
@@ -1195,7 +1199,7 @@ class App {
   WNDCLASSEXW playlistClass{};playlistClass.cbSize=sizeof(playlistClass);playlistClass.lpfnWndProc=playlistProcedure;playlistClass.hInstance=instance;playlistClass.hCursor=LoadCursorW(nullptr,IDC_ARROW);playlistClass.lpszClassName=L"MiniLyrics.Playlist";RegisterClassExW(&playlistClass);
   auto getSystemDpi=reinterpret_cast<UINT(WINAPI*)()>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"GetDpiForSystem")));if(getSystemDpi)dpi=float(getSystemDpi());
   float positionScale=positionInPixels?1.f:scale();
-  hwnd=CreateWindowExW(WS_EX_TOOLWINDOW|(top?WS_EX_TOPMOST|WS_EX_NOACTIVATE:0),cls.lpszClassName,L"MiniLyrics",WS_POPUP,int(std::round(savedX*positionScale)),int(std::round(savedY*positionScale)),int(std::round(savedWidth*scale())),int(std::round(savedHeight*scale())),nullptr,nullptr,instance,this);if(!hwnd)throw std::runtime_error("window creation failed");
+  hwnd=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_LAYERED|(top?WS_EX_TOPMOST|WS_EX_NOACTIVATE:0),cls.lpszClassName,L"MiniLyrics",WS_POPUP,int(std::round(savedX*positionScale)),int(std::round(savedY*positionScale)),int(std::round(savedWidth*scale())),int(std::round(savedHeight*scale())),nullptr,nullptr,instance,this);if(!hwnd)throw std::runtime_error("window creation failed");
   // WM_CREATE has the actual monitor DPI. Correct the initial physical size
   // before showing, keeping saved dimensions in DIP and screen positions in px.
   SetWindowPos(hwnd,nullptr,0,0,int(std::round(savedWidth*scale())),int(std::round(savedHeight*scale())),SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
