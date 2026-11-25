@@ -1080,8 +1080,10 @@ class App {
   }
   else if(type=="nowplaying"){
    bool open=m["open"].b();
-   if(open&&vinylRequested)hideForVinyl();
-   else if(!open&&vinylHidden)showFromVinyl();
+   // The lyrics page may be opened by the app itself (for example RNP's own
+   // page); hide whenever it is open, not only for our own detail request.
+   if(open)hideForVinyl();
+   else if(vinylHidden)showFromVinyl();
   }
   else if(type=="font"){if(m["size"].kind==Json::Number)setLyricFontSize(m["size"].n());report("host-state");}
   else if(type=="background"){if(readBackground(m)){save();update();}report("background-state");}
