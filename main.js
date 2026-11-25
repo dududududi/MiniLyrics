@@ -803,6 +803,52 @@ const MINILYRICS_VERSION="0.8.3";
     if(own&&!connected&&!own.connecting)retireWindow(own);
     status='小窗已关闭';refreshStatus();
   }
+  const RNP_BUTTON_ICON='data:image/svg+xml,'+encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="2.8" y="4.8" width="14.4" height="10.4" rx="2.4" fill="none" stroke="#000" stroke-width="1.8"/><path d="M6 8.4h8M6 11.2h5" stroke="#000" stroke-width="1.8" stroke-linecap="round"/><rect x="13.6" y="13.6" width="7.6" height="5.6" rx="1.8" fill="#000"/></svg>');
+  function ensureRnpButtonStyle(){
+    if(document.getElementById('minilyrics-rnp-button-style'))return;
+    const style=document.createElement('style');
+    style.id='minilyrics-rnp-button-style';
+    // Reuse RNP's own tool chrome, but swap the glyph for a "small window" mark.
+    style.textContent='#rnp-view .rnp-window-tool-minilyrics::before{width:14px;height:14px;border:none;border-radius:0;background:currentColor;'+
+      '-webkit-mask-image:url("'+RNP_BUTTON_ICON+'");-webkit-mask-repeat:no-repeat;-webkit-mask-position:center;-webkit-mask-size:contain;'+
+      'mask-image:url("'+RNP_BUTTON_ICON+'");mask-repeat:no-repeat;mask-position:center;mask-size:contain}'+
+      '#rnp-view .rnp-window-tool-minilyrics::after{display:none}';
+    document.head?.append(style);
+  }
+  function closeRnpPage(){
+    try{
+      // RNP's injected close tool runs its own teardown (body class + closed event).
+      const close=document.querySelector('#rnp-view .rnp-window-tool-plugin-close');
+      if(close){close.click();return true;}
+    }catch(e){console.debug('[MiniLyrics] 关闭 RNP 播放页失败',e);}
+    return false;
+  }
+  function ensureRnpButton(){
+    if(stopped)return;
+    try{
+      if(!document.body?.classList?.contains('rnp-lyric-page-open'))return;
+      const tools=document.querySelector('#rnp-view .rnp-window-tools');
+      if(!tools)return;
+      ensureRnpButtonStyle();
+      let button=tools.querySelector('.rnp-window-tool-minilyrics');
+      if(!button){
+        button=document.createElement('button');
+        button.type='button';
+        button.className='rnp-window-tool rnp-window-tool-minilyrics';
+        button.title='切换到 MiniLyrics 小窗';
+        button.setAttribute('aria-label','切换到 MiniLyrics 小窗');
+        tools.insertBefore(button,tools.querySelector('.rnp-window-tool-plugin-close')??null);
+      }
+      // Rebind after a plugin reload; the old instance's handler is inert.
+      if(button.__miniLyricsClick)button.removeEventListener('click',button.__miniLyricsClick);
+      button.__miniLyricsClick=event=>{
+        event.preventDefault();event.stopPropagation();
+        open();
+        closeRnpPage();
+      };
+      button.addEventListener('click',button.__miniLyricsClick);
+    }catch(e){console.debug('[MiniLyrics] 注入小窗按钮失败',e);}
+  }
   function dispose(){
     // Page reload/unload is temporary bridge loss, not a user close request.
     if(windowSession)rememberWindow(windowSession);
@@ -826,6 +872,7 @@ const MINILYRICS_VERSION="0.8.3";
         windowSession={port:saved.port,token:saved.token,session:++session,connecting:false};queueReconnect(windowSession,0);
       }
     }catch{}
+    ensureRnpButton();
   });
   plugin.onConfig(()=>{
     const el=document.createElement('div');el.style.cssText='padding:24px;line-height:1.8;max-width:700px';
@@ -864,7 +911,7 @@ const MINILYRICS_VERSION="0.8.3";
     lyricMode,lyricSource:lyricMode==='waiting'?'等待 RNP':lyricMode==='empty'?'RNP 暂无歌词':'RNP 歌词',lyricRevision,rnpSongId:providerId(window.currentLyrics),
     host:hostState,playerVersion:player?.version??null,playerFresh:playerTimelineFresh(),playerDiagnostics:playerAdapter.getDiagnostics?.()??null,
     seekPending:!!pendingSeek,seekRequest:lastSeekId,playbackState:playback.snapshot(),fontSize,background:{...background}})};
-  listen(window,'rnp-lyric-page-opened',resyncPage);
+  listen(window,'rnp-lyric-page-opened',()=>{ensureRnpButton();resyncPage();});
   listen(window,'rnp-lyric-page-closed',resyncPage);
   listen(window,'focus',resyncPage);
   listen(document,'visibilitychange',resyncPage);
