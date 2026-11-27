@@ -191,6 +191,7 @@
       if(player.openVinylPage?.()!==true)send({type:'nowplaying',open:false});
       return;
     }
+    if(m.action==='font')return changeFontSize(m.position);
     if(m.action==='select'){
       const index=Number(m.index);
       if(!Number.isInteger(index))return;
