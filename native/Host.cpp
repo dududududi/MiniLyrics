@@ -222,14 +222,15 @@ class App {
  std::vector<std::shared_ptr<LyricLayout>> lyricLayouts;
  size_t nextLayoutToWarm=0;
  static constexpr UINT_PTR LayoutWarmupTimer=5;
- static constexpr UINT_PTR PlaylistRefreshTimer=6,VinylConfirmTimer=7,PlaylistWatchTimer=1;
+ static constexpr UINT_PTR PlaylistRefreshTimer=6,VinylConfirmTimer=7,PlaylistWatchTimer=1,PlaylistAnimTimer=8;
  static constexpr float PlaylistRowHeight=44,PlaylistHeaderHeight=46;
  struct PlaylistItem {std::wstring title,artist;std::string resourceId;double duration=0;int index=0;bool current=false;};
  std::vector<PlaylistItem> playlist;int playlistCurrent=-1;
  Com<IDWriteTextFormat> playlistHeaderFormat,playlistTitleFormat,playlistMetaFormat;
  std::unique_ptr<LayeredSurface> playlistTarget;Graphics playlistGraphics;HWND playlistHwnd=nullptr;
  float playlistWidth=360,playlistHeight=180;int playlistScroll=0,playlistHover=-1;
- bool playlistOpen=false,playlistLoading=false,playlistUnsupported=false,playlistDrag=false,playlistMouseDown=false,playlistDragMoved=false,playlistTracking=false;
+ bool playlistOpen=false,playlistLoading=false,playlistUnsupported=false,playlistDrag=false,playlistMouseDown=false,playlistDragMoved=false,playlistTracking=false,playlistLocateHover=false;
+ LineTrack playlistScrollTrack;
  POINT playlistDragStart{};int playlistDragScroll=0;double playlistRevision=0;
  LyricClock indicatorMotion;double lastIndicatorTime=0;
  LyricClock motion;bool transitionActive=false,snapRow=false,testWall=false,freezePlayback=false,layoutDirty=true,stagger=true;double testWallMs=0;int focusIndex=-999,lineCurve=0,browseIndex=-1,wheelRemainder=0;double browseUntil=0;bool returnFromBrowse=false,manualTransition=false,manualLayoutPending=false;float viewportTop=32,viewportBottom=98,layoutAnchor=44,mainRowHeight=28;uint64_t groupSerial=0,layoutChanges=0;
@@ -312,9 +313,18 @@ class App {
  Layout fitted(const std::wstring&text,IDWriteTextFormat*format,float maxWidth){Layout l=layout(text,format,std::max(12.f,maxWidth));if(l.value){DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};Com<IDWriteInlineObject>sign;if(SUCCEEDED(textFactory->CreateEllipsisTrimmingSign(format,sign.put())))l.value->SetTrimming(&trim,sign.get());}return l;}
  int playlistVisibleRows()const{return std::max(1,int((playlistHeight-PlaylistHeaderHeight-6)/PlaylistRowHeight));}
  int playlistMaxScroll()const{return std::max(0,int(playlist.size())-playlistVisibleRows());}
+ float playlistVisualScroll()const{return playlistScrollTrack.value(animationWall());}
+ bool playlistLocateHit(float x,float y)const{return y<42&&x>=playlistWidth-64&&x<playlistWidth-38;}
+ void snapPlaylistScroll(){playlistScrollTrack.snap(float(playlistScroll));}
+ void animatePlaylistScroll(int target){
+  target=int(clamp(target,0,playlistMaxScroll()));playlistScroll=target;
+  double now=animationWall();playlistScrollTrack.target(float(target),now,0,260,3);
+  if(playlistOpen&&playlistScrollTrack.active(now))SetTimer(hwnd,PlaylistAnimTimer,8,nullptr);
+  paintPlaylist();
+ }
  int playlistRowAt(float x,float y)const{
   if(y<PlaylistHeaderHeight||y>playlistHeight-6||x<8||x>playlistWidth-8)return -1;
-  int row=playlistScroll+int((y-PlaylistHeaderHeight)/PlaylistRowHeight);
+  int row=int(std::floor((y-PlaylistHeaderHeight)/PlaylistRowHeight+playlistVisualScroll()));
   return row>=0&&row<int(playlist.size())?row:-1;
  }
  static std::wstring playlistTime(double ms){
@@ -354,16 +364,16 @@ class App {
  }
  void closePlaylist(){
   if(!playlistOpen&&!playlistHwnd)return;
-  playlistOpen=false;playlistDrag=false;playlistDragMoved=false;playlistHover=-1;playlistLoading=false;playlistMouseDown=false;playlistTracking=false;
-  KillTimer(hwnd,PlaylistRefreshTimer);
+  playlistOpen=false;playlistDrag=false;playlistDragMoved=false;playlistHover=-1;playlistLocateHover=false;playlistLoading=false;playlistMouseDown=false;playlistTracking=false;
+  KillTimer(hwnd,PlaylistRefreshTimer);KillTimer(hwnd,PlaylistAnimTimer);
   if(playlistHwnd){HWND window=playlistHwnd;playlistHwnd=nullptr;KillTimer(window,PlaylistWatchTimer);DestroyWindow(window);}
   playlistTarget.reset();playlistGraphics.clear();
   if(!closing)update();
  }
  void togglePlaylist(){
   if(playlistOpen){closePlaylist();return;}
-  playlistOpen=true;playlistHover=-1;playlistLoading=playlist.empty();
-  layoutPlaylistWindow(true);createPlaylistWindow();positionPlaylist();
+  playlistOpen=true;playlistHover=-1;playlistLocateHover=false;playlistLoading=playlist.empty();
+  layoutPlaylistWindow(true);snapPlaylistScroll();createPlaylistWindow();positionPlaylist();
   if(playlistHwnd)ShowWindow(playlistHwnd,SW_SHOWNOACTIVATE);
   paintPlaylist();
   SetTimer(hwnd,PlaylistRefreshTimer,2000,nullptr);
@@ -423,7 +433,11 @@ class App {
   auto header=layout(L"播放列表",playlistHeaderFormat.get());
   text(g,header,18,12,D2D1::ColorF(.95f,.96f,.99f));
   auto count=layout(playlistLoading?L"读取中":std::to_wstring(playlist.size())+L" 首",playlistMetaFormat.get());
-  text(g,count,std::max(18.f,playlistWidth-52-count.width),17,D2D1::ColorF(.72f,.75f,.84f),.9f);
+  text(g,count,std::max(18.f,playlistWidth-72-count.width),17,D2D1::ColorF(.72f,.75f,.84f),.9f);
+  float locateX=playlistWidth-51,locateY=21;
+  g.brush->SetColor(D2D1::ColorF(1,1,1,playlistLocateHover?.92f:.62f));
+  t->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(locateX,locateY),6,6),g.brush.get(),1.3f);
+  t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(locateX,locateY),1.8f,1.8f),g.brush.get());
   g.brush->SetColor(D2D1::ColorF(1,1,1,.62f));
   float closeX=playlistWidth-24,closeY=21;
   t->DrawLine(D2D1::Point2F(closeX-4,closeY-4),D2D1::Point2F(closeX+4,closeY+4),g.brush.get(),1.4f);
@@ -432,15 +446,18 @@ class App {
   t->DrawLine(D2D1::Point2F(14,PlaylistHeaderHeight-1),D2D1::Point2F(playlistWidth-14,PlaylistHeaderHeight-1),g.brush.get(),1);
   float listTop=PlaylistHeaderHeight;
   t->PushAxisAlignedClip(D2D1::RectF(6,listTop-1,std::max(7.f,playlistWidth-6),std::max(listTop,playlistHeight-5)),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+  float visual=playlistVisualScroll();
   if(playlist.empty()){
    auto empty=layout(playlistLoading?L"正在读取播放列表…":playlistUnsupported?L"当前版本不支持读取播放列表":L"播放列表为空",playlistMetaFormat.get());
    text(g,empty,(playlistWidth-empty.width)/2,listTop+42,D2D1::ColorF(.75f,.78f,.86f),.9f);
   }else{
-   int count=int(playlist.size()),visible=playlistVisibleRows(),scroll=playlistScroll;
+   int count=int(playlist.size()),visible=playlistVisibleRows();
    float durationX=playlistWidth-64;
-   for(int i=scroll;i<count&&i<scroll+visible+1;i++){
-    float top=listTop+(i-scroll)*PlaylistRowHeight;
+   int first=std::max(0,int(std::floor(visual))-1),last=std::min(count,first+visible+3);
+   for(int i=first;i<last;i++){
+    float top=listTop+(i-visual)*PlaylistRowHeight;
     if(top>playlistHeight-4)break;
+    if(top+PlaylistRowHeight<listTop)continue;
     const auto&item=playlist[i];bool current=i==playlistCurrent,hovered=i==playlistHover;
     if(current||hovered){
      auto row=D2D1::RoundedRect(D2D1::RectF(8,top+2,playlistWidth-8,top+PlaylistRowHeight-2),8,8);
@@ -463,7 +480,7 @@ class App {
   if(maxScroll>0){
    float trackTop=listTop+4,trackHeight=std::max(20.f,playlistHeight-5-trackTop);
    float thumb=std::max(24.f,trackHeight*float(playlistVisibleRows())/float(playlist.size()));
-   float offset=(trackHeight-thumb)*float(playlistScroll)/float(maxScroll);
+   float offset=float((trackHeight-thumb)*clamp(double(visual),0,maxScroll)/float(maxScroll));
    g.brush->SetColor(D2D1::ColorF(1,1,1,.18f));t->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(playlistWidth-6,trackTop,playlistWidth-3.5f,trackTop+trackHeight),1.25f,1.25f),g.brush.get());
    g.brush->SetColor(D2D1::ColorF(1,1,1,.42f));t->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(playlistWidth-6,trackTop+offset,playlistWidth-3.5f,trackTop+offset+thumb),1.25f,1.25f),g.brush.get());
   }
@@ -477,7 +494,7 @@ class App {
     if(LOWORD(lp)==HTCLIENT){
      POINT point{};GetCursorPos(&point);ScreenToClient(window,&point);
      float x=point.x/scale(),y=point.y/scale();
-     bool hand=(x>playlistWidth-38&&y<42)||playlistRowAt(x,y)>=0;
+     bool hand=(x>playlistWidth-38&&y<42)||playlistLocateHit(x,y)||playlistRowAt(x,y)>=0;
      SetCursor(LoadCursorW(nullptr,hand?IDC_HAND:IDC_ARROW));return TRUE;
     }
     break;
@@ -488,18 +505,20 @@ class App {
      if(std::abs(int(GET_Y_LPARAM(lp))-int(playlistDragStart.y))>int(4*scale()))playlistDragMoved=true;
      int delta=int((playlistDragStart.y-int(GET_Y_LPARAM(lp)))/scale()/PlaylistRowHeight);
      int next=int(clamp(playlistDragScroll+delta,0,playlistMaxScroll()));
-     if(next!=playlistScroll){playlistScroll=next;playlistHover=-1;paintPlaylist();}
+     if(next!=playlistScroll){playlistScroll=next;snapPlaylistScroll();playlistHover=-1;paintPlaylist();}
      return 0;
     }
-    int hover=playlistRowAt(x,y);
-    if(hover!=playlistHover){playlistHover=hover;paintPlaylist();}
+    bool locateHover=playlistLocateHit(x,y);
+    int hover=locateHover?-1:playlistRowAt(x,y);
+    if(hover!=playlistHover||locateHover!=playlistLocateHover){playlistHover=hover;playlistLocateHover=locateHover;paintPlaylist();}
     if(!playlistTracking){playlistTracking=true;TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,window,0};TrackMouseEvent(&event);}
     return 0;
    }
-   case WM_MOUSELEAVE:playlistTracking=false;if(playlistHover!=-1){playlistHover=-1;paintPlaylist();}return 0;
+   case WM_MOUSELEAVE:playlistTracking=false;if(playlistHover!=-1||playlistLocateHover){playlistHover=-1;playlistLocateHover=false;paintPlaylist();}return 0;
    case WM_LBUTTONDOWN:{
     float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();
     if(x>playlistWidth-38&&y<42){closePlaylist();return 0;}
+    if(playlistLocateHit(x,y)){if(playlistCurrent>=0)animatePlaylistScroll(playlistCurrent-playlistVisibleRows()/2);return 0;}
     SetCapture(window);playlistDrag=true;playlistDragMoved=false;playlistDragStart={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};playlistDragScroll=playlistScroll;
     return 0;
    }
@@ -510,13 +529,13 @@ class App {
    }
    case WM_MOUSEWHEEL:{
     int steps=GET_WHEEL_DELTA_WPARAM(wp)/WHEEL_DELTA;
-    if(steps){playlistScroll=int(clamp(playlistScroll-steps*2,0,playlistMaxScroll()));playlistHover=-1;paintPlaylist();}
+    if(steps){animatePlaylistScroll(playlistScroll-steps*2);playlistHover=-1;}
     return 0;
    }
    case WM_TIMER:if(wp==PlaylistWatchTimer)watchPlaylistOutside();return 0;
    case WM_DESTROY:{
-    KillTimer(window,PlaylistWatchTimer);playlistHwnd=nullptr;playlistOpen=false;playlistDrag=false;playlistDragMoved=false;
-    playlistTarget.reset();playlistGraphics.clear();KillTimer(hwnd,PlaylistRefreshTimer);
+    KillTimer(window,PlaylistWatchTimer);playlistHwnd=nullptr;playlistOpen=false;playlistDrag=false;playlistDragMoved=false;playlistLocateHover=false;
+    playlistTarget.reset();playlistGraphics.clear();KillTimer(hwnd,PlaylistRefreshTimer);KillTimer(hwnd,PlaylistAnimTimer);
     if(!closing)update();
     return 0;
    }
@@ -787,7 +806,7 @@ class App {
  }
  void drawLyricsAt(Graphics&g,double time,double now){
   float y=lyricAnchor();double dotsNow=indicatorNow();
-  if(!flight.rows.empty()){if(preludeDots.visible(dotsNow))drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,dotsNow);}
+  if(!flight.rows.empty()){if(flight.prelude&&preludeDots.visible(dotsNow))drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,dotsNow);}
   else switch(lyricView()){
    case LyricView::Waiting:text(g,placeholder,textX,y,D2D1::ColorF(D2D1::ColorF::White));return;
    case LyricView::StaticPreview:break;
@@ -1080,6 +1099,9 @@ class App {
     int visibleBefore=playlistVisibleRows();layoutPlaylistWindow(false);
     if(playlistScroll==0&&playlistCurrent>=visibleBefore)playlistScroll=int(clamp(playlistCurrent-playlistVisibleRows()/2,0,playlistMaxScroll()));
     playlistScroll=int(clamp(playlistScroll,0,playlistMaxScroll()));
+    double now=animationWall();
+    if(playlistScrollTrack.active(now))playlistScrollTrack.target(float(playlistScroll),now,0,260,3);
+    else snapPlaylistScroll();
     positionPlaylist();paintPlaylist();
    }
   }
@@ -1148,7 +1170,7 @@ class App {
    case WM_WINDOWPOSCHANGED:{auto result=DefWindowProcW(hwnd,msg,wp,lp);setRenderVisible(IsWindowVisible(hwnd)&&!IsIconic(hwnd));if(playlistOpen)positionPlaylist();return result;}
    case WM_SIZE:if(wp==SIZE_MINIMIZED){closePlaylist();setRenderVisible(false);return 0;}if(wp!=SIZE_MAXHIDE&&wp!=SIZE_MAXSHOW&&factory&&textFactory&&hwnd&&geometry()){if(playlistOpen)closePlaylist();update();if(resizing&&renderVisible)UpdateWindow(hwnd);}return 0;
    case WM_DPICHANGED:{closePlaylist();dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
-   case WM_TIMER:if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();else if(wp==VinylConfirmTimer){vinylRequested=false;KillTimer(hwnd,VinylConfirmTimer);}else if(wp==PlaylistRefreshTimer){if(playlistOpen)command("playlist");else KillTimer(hwnd,PlaylistRefreshTimer);}return 0;
+   case WM_TIMER:if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();else if(wp==PlaylistAnimTimer){double now=animationWall();if(playlistOpen&&playlistHwnd&&playlistScrollTrack.active(now))paintPlaylist();else{KillTimer(hwnd,PlaylistAnimTimer);if(playlistOpen&&playlistHwnd)paintPlaylist();}}else if(wp==VinylConfirmTimer){vinylRequested=false;KillTimer(hwnd,VinylConfirmTimer);}else if(wp==PlaylistRefreshTimer){if(playlistOpen)command("playlist");else KillTimer(hwnd,PlaylistRefreshTimer);}return 0;
    case WM_MOUSEWHEEL:{
     if(through||dragProgress||resizing||lines.empty())return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/scale(),y=p.y/scale();
     if(x<textX||x>width-12||y<viewportTop||y>viewportBottom)return 0;
@@ -1187,7 +1209,7 @@ class App {
    case WM_ENTERSIZEMOVE:stopFrames();if(frameTimer)WaitForSingleObject(frameTimer,0);systemMoving=true;modalFrames.start(hwnd,frameTimer,FrameReady);update();return 0;
    case WM_EXITSIZEMOVE:systemMoving=false;stopFrames();modalFrames.stop();recordNormalBounds();update();save();return 0;
    case WM_CLOSE:DestroyWindow(hwnd);return 0;
-   case WM_DESTROY:try{if(bridge)bridge->finish();}catch(...){}closing=true;closePlaylist();systemMoving=false;stopFrames();modalFrames.stop();save();KillTimer(hwnd,1);KillTimer(hwnd,2);KillTimer(hwnd,3);KillTimer(hwnd,4);KillTimer(hwnd,LayoutWarmupTimer);KillTimer(hwnd,PlaylistRefreshTimer);KillTimer(hwnd,VinylConfirmTimer);stopCoverWorker();PostQuitMessage(0);return 0;
+   case WM_DESTROY:try{if(bridge)bridge->finish();}catch(...){}closing=true;closePlaylist();systemMoving=false;stopFrames();modalFrames.stop();save();KillTimer(hwnd,1);KillTimer(hwnd,2);KillTimer(hwnd,3);KillTimer(hwnd,4);KillTimer(hwnd,LayoutWarmupTimer);KillTimer(hwnd,PlaylistRefreshTimer);KillTimer(hwnd,PlaylistAnimTimer);KillTimer(hwnd,VinylConfirmTimer);stopCoverWorker();PostQuitMessage(0);return 0;
   }return DefWindowProcW(hwnd,msg,wp,lp);
  }
  static LRESULT CALLBACK procedure(HWND window,UINT msg,WPARAM wp,LPARAM lp){App*app=reinterpret_cast<App*>(GetWindowLongPtrW(window,GWLP_USERDATA));if(msg==WM_NCCREATE){app=static_cast<App*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);app->hwnd=window;SetWindowLongPtrW(window,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(app));}if(app){try{return app->message(msg,wp,lp);}catch(...){app->error="window-message-failed";}}return DefWindowProcW(window,msg,wp,lp);}
