@@ -238,6 +238,17 @@ class App {
  std::vector<Line> lines;CoverData cover;BackgroundSettings background;BackgroundClock backgroundClock;FluidBackground fluid;
  D2D1_COLOR_F bgA=D2D1::ColorF(33/255.f,42/255.f,66/255.f),bgB=D2D1::ColorF(76/255.f,67/255.f,99/255.f);
  D2D1_RECT_F artBounds{};float artRadius=10;TransportGeometry transport{};
+ // Three fixed slots: 0 = left column, 1 = right top, 2 = right bottom.
+ // slotModule[slot] holds the module assigned to that slot.
+ static constexpr int ModuleTitle=0,ModuleCover=1,ModuleLyrics=2;
+ static constexpr float SlotMargin=12,SlotBottom=32,SlotGap=10;
+ int slotModule[3]={ModuleCover,ModuleTitle,ModuleLyrics};
+ float leftRatio=.28f,topHeight=20.f;
+ bool miniMode=false,slotLayout=false,layoutPanel=false;
+ int splitterDrag=0,splitterHover=0;
+ D2D1_RECT_F slotRects[3]{};
+ float lyricsRight=348,lyricsCenterY=65;
+ Layout metaVertical;
  bool seekPending=false;uint64_t seekSerial=0,seekRequest=0;double seekStarted=0,seekFallback=0;
  std::wstring settingsPath,capturePath,title=L"MiniLyrics",artist,coverUrl;std::string songId,error;
  double position=0,anchor=0,duration=0,offset=0,received=0,revision=0,rowSince=-1000,coverSince=-1000;
@@ -256,7 +267,14 @@ class App {
  void stopBrowsing(bool animateReturn=false){browseIndex=-1;wheelRemainder=0;browseUntil=0;returnFromBrowse=true;manualTransition=manualLayoutPending=animateReturn;KillTimer(hwnd,4);layoutDirty=true;}
  void finishTransition(){for(auto&item:groups){auto&g=item.second;g.y.snap(g.y.to);g.zoom.snap(g.zoom.to);g.mainAlpha.snap(g.mainAlpha.to);g.subAlpha.snap(g.subAlpha.to);}transitionActive=false;manualTransition=false;manualLayoutPending=false;}
  float scale()const{return dpi/96.f;}
- float lyricAnchor()const{return height/2+4-(mainRowHeight*(1+contextFontSize/currentFontSize)+11)/2;}
+ int slotOfModule(int module)const{for(int i=0;i<3;i++)if(slotModule[i]==module)return i;return -1;}
+ bool titleVertical()const{return slotLayout&&slotModule[0]==ModuleTitle;}
+ float lyricRight()const{return slotLayout?lyricsRight:width-12;}
+ float lyricWidth()const{return std::max(1.f,lyricRight()-textX);}
+ float verticalIconStep(const D2D1_RECT_F&r)const{return std::max(12.f,std::min(24.f,(r.bottom-r.top)*.55f/7));}
+ int iconCount()const{return slotLayout?7:6;}
+ int iconActionOf(int index)const{return slotLayout?index:index+1;}
+ float lyricAnchor()const{return (slotLayout?lyricsCenterY:height/2)+4-(mainRowHeight*(1+contextFontSize/currentFontSize)+11)/2;}
  enum class LyricView {Waiting,StaticPreview,Prelude,Rows};
  bool staticPreview()const{return untimed||(!valid&&!hasClock);}
  LyricView lyricView()const{if(lines.empty())return LyricView::Waiting;if(browseIndex>=0)return LyricView::Rows;if(staticPreview())return LyricView::StaticPreview;return index<0?LyricView::Prelude:LyricView::Rows;}
@@ -309,7 +327,23 @@ class App {
   lyricLayouts.clear();nextLayoutToWarm=0;
   placeholder=Layout();updatePlaceholders();save();update();scheduleLayoutWarmup();
  }
- void rebuildMeta(){metaLayout=layout(title+(artist.empty()?L"":L"  ·  "+artist),metaFormat.get(),std::max(20.f,width-textX-157));if(metaLayout.value){DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};Com<IDWriteInlineObject>sign;if(SUCCEEDED(textFactory->CreateEllipsisTrimmingSign(metaFormat.get(),sign.put())))metaLayout.value->SetTrimming(&trim,sign.get());}}
+ void rebuildMeta(){
+  float maxWidth=std::max(20.f,width-textX-157);
+  if(slotLayout){int slot=slotOfModule(ModuleTitle);maxWidth=slot==0?32.f:std::max(20.f,slotRects[slot].right-slotRects[slot].left-182.f);}
+  metaLayout=layout(title+(artist.empty()?L"":L"  ·  "+artist),metaFormat.get(),maxWidth);
+  if(metaLayout.value){DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};Com<IDWriteInlineObject>sign;if(SUCCEEDED(textFactory->CreateEllipsisTrimmingSign(metaFormat.get(),sign.put())))metaLayout.value->SetTrimming(&trim,sign.get());}
+  metaVertical=Layout();
+  std::wstring text=title+(artist.empty()?L"":L"  ·  "+artist);
+  if(slotLayout&&slotModule[0]==ModuleTitle&&!text.empty()){
+   // Vertical flow starts at the right edge of the layout box, so the box must
+   // be exactly one line wide; a wide box would push glyphs outside the slot.
+   float lineHeight=std::max(16.f,metaLayout.height);
+   check(textFactory->CreateTextLayout(text.c_str(),UINT32(text.size()),metaFormat.get(),lineHeight,50000,metaVertical.value.put()));
+   metaVertical.value->SetReadingDirection(DWRITE_READING_DIRECTION_TOP_TO_BOTTOM);
+   metaVertical.value->SetFlowDirection(DWRITE_FLOW_DIRECTION_RIGHT_TO_LEFT);
+   DWRITE_TEXT_METRICS metrics{};check(metaVertical.value->GetMetrics(&metrics));metaVertical.width=metrics.width;metaVertical.height=metrics.height;
+  }
+ }
  Layout fitted(const std::wstring&text,IDWriteTextFormat*format,float maxWidth){Layout l=layout(text,format,std::max(12.f,maxWidth));if(l.value){DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};Com<IDWriteInlineObject>sign;if(SUCCEEDED(textFactory->CreateEllipsisTrimmingSign(format,sign.put())))l.value->SetTrimming(&trim,sign.get());}return l;}
  int playlistVisibleRows()const{return std::max(1,int((playlistHeight-PlaylistHeaderHeight-6)/PlaylistRowHeight));}
  int playlistMaxScroll()const{return std::max(0,int(playlist.size())-playlistVisibleRows());}
@@ -713,11 +747,52 @@ class App {
   if(geometryPixels.cx==rect.right&&geometryPixels.cy==rect.bottom&&geometryDpi==dpi)return false;
   geometryPixels={rect.right,rect.bottom};geometryDpi=dpi;flight=LyricFlight();recordNormalBounds();
   width=std::max(1.f,float(rect.right)/scale());height=std::max(1.f,float(rect.bottom)/scale());
-  auto art=coverGeometry(rect.right,rect.bottom,scale());artSize=art.side;artRadius=art.radius;
-  artBounds=D2D1::RectF(art.left,art.top,art.left+art.side,art.top+art.side);textX=artBounds.right+16;transport=transportGeometry(width,height,textX,scale());
-  viewportTop=32;viewportBottom=std::min(height-28,transport.y-14);
-  check(factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(artBounds,artRadius,artRadius),coverClip.put()));
+  miniMode=width<=400.f||height<=170.f;
+  if(miniMode){
+   layoutPanel=false;splitterDrag=0;splitterHover=0;slotLayout=false;
+   auto art=coverGeometry(rect.right,rect.bottom,scale());artSize=art.side;artRadius=art.radius;
+   artBounds=D2D1::RectF(art.left,art.top,art.left+art.side,art.top+art.side);textX=artBounds.right+16;transport=transportGeometry(width,height,textX,scale());
+   viewportTop=32;viewportBottom=std::min(height-28,transport.y-14);
+   lyricsRight=width-12;lyricsCenterY=height/2;
+   check(factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(artBounds,artRadius,artRadius),coverClip.put()));
+  }else{
+   slotLayout=true;applySlotLayout();
+  }
   graphics.resize(width,height);rebuildMeta();layoutDirty=true;return true;
+ }
+ void applySlotLayout(){
+  const float availW=std::max(1.f,width-SlotMargin*2),availH=std::max(1.f,height-SlotMargin-SlotBottom);
+  const float minLeft=slotModule[0]==ModuleCover?110.f:96.f,maxLeft=std::max(minLeft,availW-SlotGap-110.f);
+  const float leftW=float(clamp(leftRatio*availW,minLeft,maxLeft));
+  // The top strip keeps the historical 20-DIP title bar by default; when a
+  // picture or lyrics live there it must grow to a usable height.
+  const float minTop=slotModule[1]==ModuleTitle?18.f:72.f;
+  const float maxTop=std::max(minTop,availH-60.f);
+  const float topH=float(clamp(topHeight,minTop,maxTop));
+  const float rightX=SlotMargin+leftW+SlotGap;
+  slotRects[0]=D2D1::RectF(SlotMargin,SlotMargin,SlotMargin+leftW,height-SlotBottom);
+  slotRects[1]=D2D1::RectF(rightX,SlotMargin,width-SlotMargin,SlotMargin+topH);
+  slotRects[2]=D2D1::RectF(rightX,SlotMargin+topH,width-SlotMargin,height-SlotBottom);
+  const int lyricSlot=slotOfModule(ModuleLyrics);
+  textX=slotRects[lyricSlot].left;lyricsRight=slotRects[lyricSlot].right;
+  lyricsCenterY=(slotRects[lyricSlot].top+slotRects[lyricSlot].bottom)*.5f;
+  viewportTop=slotRects[lyricSlot].top;viewportBottom=slotRects[lyricSlot].bottom;
+  transport=transportGeometry(width,height,textX,scale());
+  const auto&coverSlot=slotRects[slotOfModule(ModuleCover)];
+  RECT client{};GetClientRect(hwnd,&client);
+  const int W=std::max<LONG>(1,client.right),H=std::max<LONG>(1,client.bottom);const float s=scale();
+  float sideDip=std::max(1.f,std::min(coverSlot.right-coverSlot.left,coverSlot.bottom-coverSlot.top));
+  int side=int(std::lround(sideDip*s));
+  if((side&1)!=(H&1))--side;
+  side=std::max(1,std::min(side,std::min(W,H)));
+  int top=(H-side)/2;
+  const int slotTop=int(std::lround(coverSlot.top*s)),slotBottom=int(std::lround(coverSlot.bottom*s));
+  top=std::max(slotTop,std::min(top,slotBottom-side));
+  const int centerX=int(std::lround((coverSlot.left+coverSlot.right)*.5f*s));
+  const int left=std::max(int(std::lround(coverSlot.left*s)),std::min(centerX-side/2,int(std::lround(coverSlot.right*s))-side));
+  artBounds=D2D1::RectF(left/s,top/s,(left+side)/s,(top+side)/s);artSize=float(side)/s;
+  artRadius=float(std::max(1,std::min(side/2,int(std::lround(10*s)))))/s;
+  check(factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(artBounds,artRadius,artRadius),coverClip.put()));
  }
  void ensureTarget(){
   RECT rect{};GetClientRect(hwnd,&rect);auto size=D2D1::SizeU(std::max(1L,rect.right),std::max(1L,rect.bottom));
@@ -742,7 +817,7 @@ class App {
  float horizontalPhase(const LyricGroup&g,double time,int id,double now)const{
   if(g.content->glyphs.empty())return timedHorizontalPhase(g,time,id);
   if(!canScroll(id))return 0;
-  float zoom=std::max(.01f,g.zoom.value(now)),available=std::max(1.f,width-textX-12),overflow=rowWidth(g)*zoom-available;
+  float zoom=std::max(.01f,g.zoom.value(now)),available=lyricWidth(),overflow=rowWidth(g)*zoom-available;
   if(overflow<=0)return 0;
   const auto&last=g.content->glyphs.back();if(time>=last.time+last.duration)return 1;
   // Track the sung position in measured text space. Gaps hold this cursor;
@@ -761,7 +836,7 @@ class App {
  }
  void drawGroupAt(Graphics&g,const LyricGroup&r,int id,double time,double now){
   if(r.opacity<=0)return;float zoom=std::max(.01f,r.zoom.value(now)),y=r.y.value(now);
-  float available=std::max(1.f,width-textX-12),phase=horizontalPhase(r,time,id,now);
+  float available=lyricWidth(),phase=horizontalPhase(r,time,id,now);
   D2D1_MATRIX_3X2_F transform;bool scaled=zoom!=1.f;float originX=textX,originY=y;
   if(scaled){g.target->GetTransform(&transform);g.target->SetTransform(D2D1::Matrix3x2F::Scale(zoom,zoom)*D2D1::Matrix3x2F::Translation(textX,y)*transform);originX=originY=0;}
   float x=originX-std::max(0.f,rowWidth(r)*zoom-available)*phase/zoom;
@@ -837,13 +912,13 @@ class App {
    t->DrawBitmap(g.cover.get(),artBounds,coverAlpha,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,D2D1::RectF(x,y,x+side,y+side));
    t->PopLayer();
   }
-  text(g,metaLayout,textX,12,D2D1::ColorF(.87f,.89f,.94f));
-  t->PushAxisAlignedClip(D2D1::RectF(textX,viewportTop,width-12,viewportBottom),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+  drawTitle(g);
+  t->PushAxisAlignedClip(D2D1::RectF(textX,viewportTop,lyricRight(),viewportBottom),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
   drawLyricsAt(g,time,now);
   t->PopAxisAlignedClip();
   if(hover&&!through){
-   float y=transport.y;g.brush->SetColor(D2D1::ColorF(.55f,.58f,.69f));t->DrawLine(D2D1::Point2F(textX,y),D2D1::Point2F(transport.right,y),g.brush.get(),3);
-   float ratio=float(dragProgress?dragRatio:duration>0?clamp(current()/duration,0,1):0);g.brush->SetColor(D2D1::ColorF(.91f,.93f,.99f));t->DrawLine(D2D1::Point2F(textX,y),D2D1::Point2F(transport.left+transport.length()*ratio,y),g.brush.get(),3);t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(transport.left+transport.length()*ratio,y),3,3),g.brush.get());
+   float y=transport.y;g.brush->SetColor(D2D1::ColorF(.55f,.58f,.69f));t->DrawLine(D2D1::Point2F(transport.left,y),D2D1::Point2F(transport.right,y),g.brush.get(),3);
+   float ratio=float(dragProgress?dragRatio:duration>0?clamp(current()/duration,0,1):0);g.brush->SetColor(D2D1::ColorF(.91f,.93f,.99f));t->DrawLine(D2D1::Point2F(transport.left,y),D2D1::Point2F(transport.left+transport.length()*ratio,y),g.brush.get(),3);t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(transport.left+transport.length()*ratio,y),3,3),g.brush.get());
    // Transport buttons use vectors, not font glyphs with different baselines.
    float cy=y,previous=transport.previous,next=transport.next,play=transport.play;
    g.brush->SetColor(D2D1::ColorF(D2D1::ColorF::White));
@@ -853,21 +928,146 @@ class App {
    t->DrawLine(D2D1::Point2F(next+3,cy),D2D1::Point2F(next-3,cy+5),g.brush.get(),2);
    if(playing){float halfGap=std::round(2*scale())/scale(),barWidth=std::round(3*scale())/scale(),halfHeight=std::round(7*scale())/scale();t->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(play-halfGap-barWidth,cy-halfHeight,play-halfGap,cy+halfHeight),.6f,.6f),g.brush.get());t->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(play+halfGap,cy-halfHeight,play+halfGap+barWidth,cy+halfHeight),.6f,.6f),g.brush.get());}
    else {D2D1_MATRIX_3X2_F transform;t->GetTransform(&transform);t->SetTransform(D2D1::Matrix3x2F::Translation(play,cy)*transform);t->FillGeometry(playGeometry.get(),g.brush.get());t->SetTransform(transform);}
-   float hx=width-138;
-   D2D1_MATRIX_3X2_F iconTransform;t->GetTransform(&iconTransform);t->SetTransform(D2D1::Matrix3x2F::Translation(hx,20.5f)*iconTransform);
-   if(liked){g.brush->SetColor(D2D1::ColorF(1.f,.36f,.47f));t->FillGeometry(likeGeometry.get(),g.brush.get());}
-   else{g.brush->SetColor(D2D1::ColorF(1,1,1,.82f));t->DrawGeometry(likeGeometry.get(),g.brush.get(),1.2f);}
-   t->SetTransform(iconTransform);
-   g.brush->SetColor(D2D1::ColorF(1,1,1,vinylRequested?1.f:.82f));float vx=width-114;
-   t->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(vx,20),5.5f,5.5f),g.brush.get(),1.1f);
-   t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(vx,20),1.5f,1.5f),g.brush.get());
-   g.brush->SetColor(D2D1::ColorF(1,1,1,playlistOpen?1.f:.82f));float lx=width-90;
-   for(int line=0;line<3;line++){float ly=16+line*4;t->DrawLine(D2D1::Point2F(lx-3,ly),D2D1::Point2F(lx+5,ly),g.brush.get(),1.4f);t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(lx-6,ly),1.1f,1.1f),g.brush.get());}
-   g.brush->SetColor(D2D1::ColorF(1,1,1,top?1.f:.4f));float x=width-66;t->DrawLine(D2D1::Point2F(x-3,15),D2D1::Point2F(x+3,15),g.brush.get(),2);t->DrawLine(D2D1::Point2F(x,13),D2D1::Point2F(x,25),g.brush.get(),1.5f);
-   g.brush->SetColor(D2D1::ColorF(1,1,1));x=width-42;t->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x-4,18,x+4,25),1,1),g.brush.get(),1);t->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x,17),3,4),g.brush.get(),1);
-   x=width-18;t->DrawLine(D2D1::Point2F(x-3,16),D2D1::Point2F(x+3,22),g.brush.get(),1.5f);t->DrawLine(D2D1::Point2F(x+3,16),D2D1::Point2F(x-3,22),g.brush.get(),1.5f);
   }
   if(!through){g.brush->SetColor(D2D1::ColorF(1,1,1,hover?.5f:.2f));for(int line=1;line<=3;line++){float d=3.f+line*4.5f;t->DrawLine(D2D1::Point2F(width-d,height-3),D2D1::Point2F(width-3,height-d),g.brush.get(),1);}}
+  drawSplitters(g);
+  drawLayoutPanel(g);
+ }
+ void drawTitle(Graphics&g){
+  auto*t=g.target;
+  if(!slotLayout){text(g,metaLayout,textX,12,D2D1::ColorF(.87f,.89f,.94f));}
+  else{
+   int slot=slotOfModule(ModuleTitle);const auto&r=slotRects[slot];
+   if(slot==0){
+    float iconsTop=r.bottom-8-verticalIconStep(r)*7;
+    if(metaVertical.value){
+     float x=r.left+(r.right-r.left-metaVertical.width)*.5f;
+     t->PushAxisAlignedClip(D2D1::RectF(r.left+1,r.top+2,r.right-1,std::max(r.top+2.f,iconsTop-4)),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+     text(g,metaVertical,x,r.top+4,D2D1::ColorF(.87f,.89f,.94f));
+     t->PopAxisAlignedClip();
+    }
+   }else text(g,metaLayout,r.left,r.top+(r.bottom-r.top-metaLayout.height)*.5f,D2D1::ColorF(.87f,.89f,.94f));
+  }
+  if(hover&&!through)drawIcons(g);
+ }
+ int iconAt(float x,float y)const{
+  if(through||!hover)return -1;
+  if(!slotLayout){
+   if(y>=0&&y<=32&&x>=width-150){int i=int((x-(width-150))/24);return i>=0&&i<6?i+1:-1;}
+   return -1;
+  }
+  int slot=slotOfModule(ModuleTitle);const auto&r=slotRects[slot];
+  if(slot==0){
+   float step=verticalIconStep(r),top=r.bottom-8-step*7,cx=(r.left+r.right)*.5f;
+   if(std::abs(x-cx)<=10&&y>=top&&y<=r.bottom){int i=int((y-top)/step);return i>=0&&i<7?i:-1;}
+  }else{
+   float zoneLeft=r.right-174;
+   if(y>=r.top&&y<=r.bottom&&x>=zoneLeft&&x<=r.right){int i=int((x-zoneLeft)/24);return i>=0&&i<7?i:-1;}
+  }
+  return -1;
+ }
+ void drawIcons(Graphics&g){
+  auto*t=g.target;int count=iconCount();
+  float step=24.f,cx=0.f,cy=0.f;bool vertical=slotLayout&&slotModule[0]==ModuleTitle;
+  if(!slotLayout){cx=width-138;cy=20;}
+  else{
+   int slot=slotOfModule(ModuleTitle);const auto&r=slotRects[slot];
+   if(vertical){step=verticalIconStep(r);cx=(r.left+r.right)*.5f;cy=r.bottom-8-step*7+step*.5f;}
+   else{cx=r.right-162;cy=r.top+(r.bottom-r.top)*.5f;}
+  }
+  for(int i=0;i<count;i++){
+   float x=vertical?cx:cx+step*i,y=vertical?cy+step*i:cy;
+   drawIcon(g,iconActionOf(i),x,y);
+  }
+ }
+ void drawIcon(Graphics&g,int action,float x,float y){
+  auto*t=g.target;float acc=.82f;
+  if(action==0){
+   g.brush->SetColor(D2D1::ColorF(1,1,1,.82f));
+   t->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x,y),4.4f,4.4f),g.brush.get(),1.1f);
+   t->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x,y),1.7f,1.7f),g.brush.get(),1);
+   for(int k=0;k<8;k++){float a=float(k)*3.14159265f/4;float c=std::cos(a),s=std::sin(a);t->DrawLine(D2D1::Point2F(x+c*4.4f,y+s*4.4f),D2D1::Point2F(x+c*6.3f,y+s*6.3f),g.brush.get(),1.2f);}
+   return;
+  }
+  if(action==1){
+   D2D1_MATRIX_3X2_F transform;t->GetTransform(&transform);t->SetTransform(D2D1::Matrix3x2F::Translation(x,y)*transform);
+   if(liked){g.brush->SetColor(D2D1::ColorF(1.f,.36f,.47f));t->FillGeometry(likeGeometry.get(),g.brush.get());}
+   else{g.brush->SetColor(D2D1::ColorF(1,1,1,acc));t->DrawGeometry(likeGeometry.get(),g.brush.get(),1.2f);}
+   t->SetTransform(transform);return;
+  }
+  if(action==2){
+   g.brush->SetColor(D2D1::ColorF(1,1,1,vinylRequested?1.f:acc));
+   t->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x,y),5.5f,5.5f),g.brush.get(),1.1f);
+   t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x,y),1.5f,1.5f),g.brush.get());return;
+  }
+  if(action==3){
+   g.brush->SetColor(D2D1::ColorF(1,1,1,playlistOpen?1.f:acc));
+   for(int line=0;line<3;line++){float ly=y-4+line*4;t->DrawLine(D2D1::Point2F(x-3,ly),D2D1::Point2F(x+5,ly),g.brush.get(),1.4f);t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x-6,ly),1.1f,1.1f),g.brush.get());}
+   return;
+  }
+  if(action==4){
+   g.brush->SetColor(D2D1::ColorF(1,1,1,top?1.f:.4f));
+   t->DrawLine(D2D1::Point2F(x-3,y-5),D2D1::Point2F(x+3,y-5),g.brush.get(),2);t->DrawLine(D2D1::Point2F(x,y-7),D2D1::Point2F(x,y+5),g.brush.get(),1.5f);return;
+  }
+  if(action==5){
+   g.brush->SetColor(D2D1::ColorF(1,1,1));
+   t->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x-4,y-2,x+4,y+5),1,1),g.brush.get(),1);t->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x,y-3),3,4),g.brush.get(),1);return;
+  }
+  g.brush->SetColor(D2D1::ColorF(1,1,1));
+  t->DrawLine(D2D1::Point2F(x-3,y-4),D2D1::Point2F(x+3,y+2),g.brush.get(),1.5f);t->DrawLine(D2D1::Point2F(x+3,y-4),D2D1::Point2F(x-3,y+2),g.brush.get(),1.5f);
+ }
+ void drawSplitters(Graphics&g){
+  if(!slotLayout||layoutPanel||(!hover&&!splitterDrag))return;
+  auto*t=g.target;float alpha=splitterDrag?.45f:splitterHover?.38f:.16f;
+  g.brush->SetColor(D2D1::ColorF(1,1,1,alpha));
+  float vx=slotRects[0].right+SlotGap*.5f,hy=slotRects[1].bottom;
+  t->DrawLine(D2D1::Point2F(vx,slotRects[0].top),D2D1::Point2F(vx,slotRects[0].bottom),g.brush.get(),1);
+  t->DrawLine(D2D1::Point2F(slotRects[1].left,hy),D2D1::Point2F(slotRects[1].right,hy),g.brush.get(),1);
+ }
+ int splitterAt(float x,float y)const{
+  if(!slotLayout||miniMode||layoutPanel)return 0;
+  if(std::abs(x-(slotRects[0].right+SlotGap*.5f))<=4&&y>=slotRects[0].top&&y<=slotRects[0].bottom)return 1;
+  if(std::abs(y-slotRects[1].bottom)<=3&&x>=slotRects[1].left&&x<=slotRects[1].right)return 2;
+  return 0;
+ }
+ struct LayoutPanelGeometry {D2D1_RECT_F card,close,chips[3][3];};
+ LayoutPanelGeometry panelGeometry()const{
+  LayoutPanelGeometry p{};
+  float w=std::min(width-20.f,380.f),h=std::min(height-16.f,162.f);
+  float x=(width-w)*.5f,y=(height-h)*.5f;
+  p.card=D2D1::RectF(x,y,x+w,y+h);p.close=D2D1::RectF(x+w-30,y+6,x+w-8,y+28);
+  float rowTop=y+40.f,rowH=std::min(36.f,(h-46.f)/3.f),chipW=std::min(76.f,(w-88.f-24.f)/3.f);
+  for(int s=0;s<3;s++)for(int c=0;c<3;c++){float cx=x+76.f+c*(chipW+6.f),cy=rowTop+s*rowH;p.chips[s][c]=D2D1::RectF(cx,cy,cx+chipW,cy+rowH-6.f);}
+  return p;
+ }
+ bool panelChipAt(float x,float y,int&slot,int&module)const{
+  auto p=panelGeometry();
+  for(int s=0;s<3;s++)for(int c=0;c<3;c++){const auto&r=p.chips[s][c];if(x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom){slot=s;module=c==0?ModuleCover:c==1?ModuleLyrics:ModuleTitle;return true;}}
+  return false;
+ }
+ bool panelCloseAt(float x,float y)const{auto p=panelGeometry();return x>=p.close.left&&x<=p.close.right&&y>=p.close.top&&y<=p.close.bottom;}
+ bool panelInside(float x,float y)const{auto p=panelGeometry();return x>=p.card.left&&x<=p.card.right&&y>=p.card.top&&y<=p.card.bottom;}
+ void drawLayoutPanel(Graphics&g){
+  if(!layoutPanel)return;
+  auto*t=g.target;auto p=panelGeometry();auto card=D2D1::RoundedRect(p.card,14,14);
+  g.brush->SetColor(D2D1::ColorF(.09f,.10f,.14f,.98f));t->FillRoundedRectangle(card,g.brush.get());
+  g.brush->SetColor(D2D1::ColorF(.62f,.65f,.80f,.6f));t->DrawRoundedRectangle(card,g.brush.get(),1);
+  g.brush->SetColor(D2D1::ColorF(1,1,1,.55f));
+  t->DrawLine(D2D1::Point2F(p.close.left,p.close.top),D2D1::Point2F(p.close.right,p.close.bottom),g.brush.get(),1.4f);
+  t->DrawLine(D2D1::Point2F(p.close.right,p.close.top),D2D1::Point2F(p.close.left,p.close.bottom),g.brush.get(),1.4f);
+  auto heading=layout(L"布局设置",metaFormat.get());
+  text(g,heading,p.card.left+14,p.card.top+12,D2D1::ColorF(.95f,.96f,.99f));
+  for(int s=0;s<3;s++){
+   Layout label=layout(s==0?L"左槽":s==1?L"右上":L"右下",metaFormat.get());
+   text(g,label,p.card.left+14,p.chips[s][0].top+(p.chips[s][0].bottom-p.chips[s][0].top-label.height)*.5f,D2D1::ColorF(.72f,.75f,.84f),.9f);
+   for(int c=0;c<3;c++){
+    int module=c==0?ModuleCover:c==1?ModuleLyrics:ModuleTitle;const auto&r=p.chips[s][c];bool active=slotModule[s]==module;
+    g.brush->SetColor(D2D1::ColorF(1,1,1,active?.20f:.06f));t->FillRoundedRectangle(D2D1::RoundedRect(r,8,8),g.brush.get());
+    if(active){g.brush->SetColor(D2D1::ColorF(1,1,1,.55f));t->DrawRoundedRectangle(D2D1::RoundedRect(r,8,8),g.brush.get(),1);}
+    Layout chip=layout(module==ModuleCover?L"封面":module==ModuleLyrics?L"歌词":L"标题",metaFormat.get());
+    text(g,chip,r.left+(r.right-r.left-chip.width)*.5f,r.top+(r.bottom-r.top-chip.height)*.5f,active?D2D1::ColorF(1,1,1):D2D1::ColorF(.80f,.83f,.90f),active?1.f:.85f);
+   }
+  }
  }
  void stopFrames(){if(frameRunning||frameArmed){KillTimer(hwnd,1);if(frameTimer)CancelWaitableTimer(frameTimer);}frameArmed=false;frameRunning=false;frameDeadline=0;}
  void setRenderVisible(bool visible){
@@ -882,7 +1082,7 @@ class App {
   if(playing&&valid&&!untimed)for(const auto&item:groups){const auto&g=item.second;if(!groupVisible(g,motionNow()))continue;const auto&line=g.content->model;
    if(indicatorVisible(g))active=true;
    if(g.active)for(const auto&word:line.words){if(time>=word.time&&time<word.time+word.duration+150)active=true;else if(word.time>time)next=std::min(next,word.time-time);}
-   if(canScroll(item.first)&&((g.content->glyphs.empty()&&rowWidth(g)*g.zoom.value(motionNow())>width-textX-12)||(g.translated&&g.content->subtitle.width*g.zoom.value(motionNow())>width-textX-12))){double begin=line.time+900,end=begin+std::max(1200.,(line.duration>0?line.duration:4000)-1600);if(time<begin)next=std::min(next,begin-time);else if(time<end)active=true;}
+   if(canScroll(item.first)&&((g.content->glyphs.empty()&&rowWidth(g)*g.zoom.value(motionNow())>lyricWidth())||(g.translated&&g.content->subtitle.width*g.zoom.value(motionNow())>lyricWidth()))){double begin=line.time+900,end=begin+std::max(1200.,(line.duration>0?line.duration:4000)-1600);if(time<begin)next=std::min(next,begin-time);else if(time<end)active=true;}
   }
   bool flying=!flight.rows.empty(),coverAnimating=coverSince>=0&&nowMs()-coverSince<250;active=active||coverAnimating||flying;
   bool backgroundActive=backgroundAnimating();bool run=flying||manualTransition||(playing&&valid&&((!untimed&&!lines.empty())||hover||coverAnimating||backgroundActive));double wanted=active?1000./(fps==60?60:30):std::max(1.,next);if(backgroundActive)wanted=std::min(wanted,1000./background.fps);
@@ -965,7 +1165,7 @@ class App {
   j["backgroundBackend"]=fluid.backend();j["backgroundGpuReady"]=fluid.gpuReady();if(!fluid.gpuError.empty())j["backgroundGpuError"]=fluid.gpuError;
   if(type=="background-state")j["background"]=backgroundState();return j;
  }
- Json diagnostics(const std::string&type,bool accepted=true){Json j=state(type,accepted);j["currentLineIndex"]=index;j["index"]=index;j["frameRunning"]=frameRunning;j["intervalMs"]=int(intervalMs);j["renderCalls"]=double(renderCalls);j["lineBuildCalls"]=double(lineBuildCalls);j["backend"]="Direct2D/DirectWrite";j["hardware"]=hardware;j["renderVisible"]=renderVisible;j["through"]=through;j["top"]=top;j["liked"]=liked;j["windowTopmost"]=(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_TOPMOST)!=0;j["windowNoActivate"]=(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_NOACTIVATE)!=0;j["fps"]=fps;j["fontSize"]=currentFontSize;j["systemMoving"]=systemMoving;j["frameScheduler"]=frameTimer&&(!systemMoving||modalFrames.active())?(systemMoving?"waitable-posted":"waitable-deadline"):"window-timer";j["coverLoaded"]=!cover.pixels.empty();j["dpi"]=double(dpi);j["coverLeftPx"]=std::round(artBounds.left*scale());j["coverTopPx"]=std::round(artBounds.top*scale());j["coverSidePx"]=std::round(artSize*scale());j["coverRadiusPx"]=std::round(artRadius*scale());j["windowHeightPx"]=std::round(height*scale());j["iconBackend"]="vector";j["windowWidthPx"]=std::round(width*scale());j["barLeftPx"]=transport.left*scale();j["barRightPx"]=transport.right*scale();j["controlYPx"]=transport.y*scale();j["previousPx"]=transport.previous*scale();j["playPx"]=transport.play*scale();j["nextPx"]=transport.next*scale();j["rowStartedMs"]=rowSince;j["focusIndex"]=focusIndex;j["browsing"]=browseIndex>=0;j["browseIndex"]=browseIndex;j["browseRemainingMs"]=browseIndex>=0?std::max(0.,browseUntil-animationWall()):0;j["groupCacheLimit"]=32;j["transitionActive"]=transitionActive;j["transitionProgress"]=unit((motionNow()-rowSince-200)/500);j["transitionMode"]=transitionActive?"group-scroll":"none";j["animationTimeMs"]=motionNow();j["retainedRows"]=int(groups.size());j["layoutChanges"]=double(layoutChanges);j["lookaheadMs"]=stagger?200:0;j["stagger"]=stagger;j["curve"]=lineCurve;j["viewportTop"]=viewportTop;j["viewportBottom"]=viewportBottom;j["groupGap"]=GroupGap;j["layoutAnchor"]=layoutAnchor;j["groups"].kind=Json::Array;
+ Json diagnostics(const std::string&type,bool accepted=true){Json j=state(type,accepted);j["currentLineIndex"]=index;j["index"]=index;j["frameRunning"]=frameRunning;j["intervalMs"]=int(intervalMs);j["renderCalls"]=double(renderCalls);j["lineBuildCalls"]=double(lineBuildCalls);j["backend"]="Direct2D/DirectWrite";j["hardware"]=hardware;j["renderVisible"]=renderVisible;j["through"]=through;j["top"]=top;j["liked"]=liked;j["windowTopmost"]=(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_TOPMOST)!=0;j["windowNoActivate"]=(GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_NOACTIVATE)!=0;j["fps"]=fps;j["fontSize"]=currentFontSize;j["systemMoving"]=systemMoving;j["frameScheduler"]=frameTimer&&(!systemMoving||modalFrames.active())?(systemMoving?"waitable-posted":"waitable-deadline"):"window-timer";j["coverLoaded"]=!cover.pixels.empty();j["dpi"]=double(dpi);j["coverLeftPx"]=std::round(artBounds.left*scale());j["coverTopPx"]=std::round(artBounds.top*scale());j["coverSidePx"]=std::round(artSize*scale());j["coverRadiusPx"]=std::round(artRadius*scale());j["windowHeightPx"]=std::round(height*scale());j["iconBackend"]="vector";j["windowWidthPx"]=std::round(width*scale());j["barLeftPx"]=transport.left*scale();j["barRightPx"]=transport.right*scale();j["controlYPx"]=transport.y*scale();j["previousPx"]=transport.previous*scale();j["playPx"]=transport.play*scale();j["nextPx"]=transport.next*scale();j["rowStartedMs"]=rowSince;j["focusIndex"]=focusIndex;j["browsing"]=browseIndex>=0;j["browseIndex"]=browseIndex;j["browseRemainingMs"]=browseIndex>=0?std::max(0.,browseUntil-animationWall()):0;j["groupCacheLimit"]=32;j["transitionActive"]=transitionActive;j["transitionProgress"]=unit((motionNow()-rowSince-200)/500);j["transitionMode"]=transitionActive?"group-scroll":"none";j["animationTimeMs"]=motionNow();j["retainedRows"]=int(groups.size());j["layoutChanges"]=double(layoutChanges);j["lookaheadMs"]=stagger?200:0;j["stagger"]=stagger;j["curve"]=lineCurve;j["viewportTop"]=viewportTop;j["viewportBottom"]=viewportBottom;j["groupGap"]=GroupGap;j["layoutAnchor"]=layoutAnchor;j["layoutMini"]=miniMode;j["layoutSlots"].kind=Json::Array;for(int i=0;i<3;i++)j["layoutSlots"].array.push_back(Json(slotModule[i]));j["layoutLeftRatio"]=double(leftRatio);j["layoutTopHeight"]=double(topHeight);j["layoutPanelOpen"]=layoutPanel;j["lyricLeftPx"]=textX*scale();j["lyricRightPx"]=lyricRight()*scale();j["metaVerticalWidth"]=metaVertical.width;j["metaVerticalHeight"]=metaVertical.height;j["groups"].kind=Json::Array;
   for(const auto&item:groups){const auto&g=item.second;Json v=Json::obj();v["index"]=item.first;v["identity"]=double(g.identity);v["text"]=narrow(g.content->model.text);v["translation"]=g.translated?narrow(g.content->model.translation):"";v["top"]=g.y.value(motionNow());v["target"]=g.y.to;v["startAt"]=g.y.start;v["durationMs"]=g.y.duration;v["height"]=g.renderedHeight(1.f);v["scale"]=g.zoom.value(motionNow());v["scaleTarget"]=g.zoom.to;v["scaleStartAt"]=g.zoom.start;v["scaleDurationMs"]=g.zoom.duration;v["renderedHeight"]=g.renderedHeight(g.zoom.value(motionNow()));v["fontSize"]=currentFontSize*g.zoom.value(motionNow());v["translationFontSize"]=g.translated?translationFontSize*g.zoom.value(motionNow()):0.f;v["rendered"]=groupVisible(g,motionNow());v["mainHeight"]=g.content->mainHeight;v["subOffset"]=g.subtitleOffset(g.zoom.value(motionNow()));v["mainAlpha"]=g.mainAlpha.value(motionNow());v["subAlpha"]=g.subAlpha.value(motionNow());v["active"]=g.active;j["groups"].array.push_back(std::move(v));}
   j["seekFlight"]=!flight.rows.empty();if(!flight.rows.empty()){j["transitionMode"]="seek-flight";j["transitionActive"]=true;j["transitionProgress"]=unit((animationWall()-flight.started)/(500+(flight.stagger?400:0)));}j["background"]=backgroundState();j["backgroundAnimating"]=backgroundAnimating();j["backgroundFrameBuilds"]=double(fluid.revision);j["backgroundBackend"]=fluid.backend();j["backgroundGpuReady"]=fluid.gpuReady();j["backgroundGpuError"]=fluid.gpuError;j["backgroundTimeMs"]=backgroundClock.time(animationWall());j["first"]=index>=0&&index<int(lines.size())?narrow(lines[index].text):"";j["second"]=index>=0&&index<int(lines.size())?(translation&&!lines[index].translation.empty()?narrow(lines[index].translation):index+1<int(lines.size())?narrow(lines[index+1].text):""):"";j["playlistCount"]=int(playlist.size());j["playlistOpen"]=playlistOpen;return j;}
  void report(const std::string&type,bool accepted=true,bool detailed=false){if(bridge)bridge->send(detailed?diagnostics(type,accepted):state(type,accepted));}
@@ -1145,7 +1345,7 @@ class App {
   if(!IsIconic(hwnd)){if(!GetWindowRect(hwnd,&rect))return;}
   else if(hasNormalRect){rect=normalWindowRect;rectScale=normalWindowScale;}
   else{float s=positionInPixels?1.f:rectScale;rect={int(std::lround(savedX*s)),int(std::lround(savedY*s)),0,0};rect.right=rect.left+int(std::lround(savedWidth*rectScale));rect.bottom=rect.top+int(std::lround(savedHeight*rectScale));}
-  Json j=Json::obj();j["X"]=int(rect.left);j["Y"]=int(rect.top);j["PositionInPixels"]=true;j["Width"]=(rect.right-rect.left)/rectScale;j["Height"]=(rect.bottom-rect.top)/rectScale;j["Top"]=top;j["Translation"]=translation;j["Fps"]=fps;j["FontSize"]=currentFontSize;j["Background"]=backgroundState();
+  Json j=Json::obj();j["X"]=int(rect.left);j["Y"]=int(rect.top);j["PositionInPixels"]=true;j["Width"]=(rect.right-rect.left)/rectScale;j["Height"]=(rect.bottom-rect.top)/rectScale;j["Top"]=top;j["Translation"]=translation;j["Fps"]=fps;j["FontSize"]=currentFontSize;j["Background"]=backgroundState();j["Layout"]=layoutState();
   try{
    auto path=std::filesystem::path(settingsPath);std::filesystem::create_directories(path.parent_path());
    auto tmp=path;tmp+=L".tmp."+std::to_wstring(GetCurrentProcessId());
@@ -1156,6 +1356,29 @@ class App {
     std::ofstream file(path,std::ios::binary|std::ios::trunc);file.write(payload.data(),std::streamsize(payload.size()));
    }
   }catch(...){}
+ }
+ Json layoutState()const{
+  Json j=Json::obj();Json slots;slots.kind=Json::Array;
+  for(int i=0;i<3;i++)slots.array.push_back(Json(slotModule[i]));
+  j["Slots"]=slots;j["Left"]=double(leftRatio);j["Top"]=double(topHeight);return j;
+ }
+ void readLayout(const Json&j){
+  if(j.kind!=Json::Object)return;
+  const auto&s=j["Slots"];
+  if(s.kind==Json::Array&&s.array.size()==3){
+   int next[3];bool seen[3]={false,false,false},ok=true;
+   for(int i=0;i<3;i++){double v=s.array[i].n(-1);int m=int(v);if(v<0||v>2||m<0||m>2||seen[m]){ok=false;break;}seen[m]=true;next[i]=m;}
+   if(ok)for(int i=0;i<3;i++)slotModule[i]=next[i];
+  }
+  if(j["Left"].kind==Json::Number)leftRatio=float(clamp(j["Left"].n(),0.12,0.6));
+  if(j["Top"].kind==Json::Number)topHeight=float(clamp(j["Top"].n(),18,400));
+ }
+ void toggleLayoutPanel(){if(miniMode)return;layoutPanel=!layoutPanel;if(layoutPanel)closePlaylist();update();}
+ void assignSlot(int slot,int module){
+  if(miniMode)return;int from=slotOfModule(module);if(from<0||from==slot)return;
+  int displaced=slotModule[slot];slotModule[slot]=slotModule[from];slotModule[from]=displaced;
+  if(slotLayout)applySlotLayout();
+  rebuildMeta();layoutDirty=true;save();update();
  }
  void menu(POINT point){HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING|(translation?MF_CHECKED:0),1,L"显示翻译");AppendMenuW(menu,MF_STRING|(top?MF_CHECKED:0),2,L"置顶");AppendMenuW(menu,MF_STRING|(through?MF_CHECKED:0),3,L"鼠标穿透（在插件设置中恢复）");AppendMenuW(menu,MF_STRING|(fps==30?MF_CHECKED:0),4,L"30 FPS");AppendMenuW(menu,MF_STRING|(fps==60?MF_CHECKED:0),5,L"60 FPS");AppendMenuW(menu,MF_STRING,6,L"关闭小窗");SetForegroundWindow(hwnd);int choice=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,hwnd,nullptr);DestroyMenu(menu);if(choice==1){translation=!translation;layoutDirty=true;}else if(choice==2)setTop(!top);else if(choice==3)setThrough(!through);else if(choice==4)fps=30;else if(choice==5)fps=60;else if(choice==6){DestroyWindow(hwnd);return;}save();update();}
  LRESULT message(UINT msg,WPARAM wp,LPARAM lp){
@@ -1172,8 +1395,8 @@ class App {
    case WM_DPICHANGED:{closePlaylist();dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
    case WM_TIMER:if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();else if(wp==PlaylistAnimTimer){double now=animationWall();if(playlistOpen&&playlistHwnd&&playlistScrollTrack.active(now))paintPlaylist();else{KillTimer(hwnd,PlaylistAnimTimer);if(playlistOpen&&playlistHwnd)paintPlaylist();}}else if(wp==VinylConfirmTimer){vinylRequested=false;KillTimer(hwnd,VinylConfirmTimer);}else if(wp==PlaylistRefreshTimer){if(playlistOpen)command("playlist");else KillTimer(hwnd,PlaylistRefreshTimer);}return 0;
    case WM_MOUSEWHEEL:{
-    if(through||dragProgress||resizing||lines.empty())return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/scale(),y=p.y/scale();
-    if(x<textX||x>width-12||y<viewportTop||y>viewportBottom)return 0;
+    if(through||dragProgress||resizing||layoutPanel||lines.empty())return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/scale(),y=p.y/scale();
+    if(x<textX||x>lyricRight()||y<viewportTop||y>viewportBottom)return 0;
     wheelRemainder+=GET_WHEEL_DELTA_WPARAM(wp);int steps=wheelRemainder/WHEEL_DELTA;wheelRemainder%=WHEEL_DELTA;if(!steps)return 0;
     int origin=browseIndex>=0?browseIndex:(untimed&&focusIndex>=0?focusIndex:index);
     int next=browseStep(origin,steps);if(next<0)return 0;flight=LyricFlight();browseIndex=next;manualTransition=manualLayoutPending=true;browseUntil=animationWall()+4000;if(!untimed)SetTimer(hwnd,4,4000,nullptr);layoutDirty=true;update();return 0;
@@ -1181,9 +1404,13 @@ class App {
    case WM_SETCURSOR:{
     if(LOWORD(lp)==HTCLIENT&&!through){
      POINT pt{};GetCursorPos(&pt);ScreenToClient(hwnd,&pt);float x=pt.x/scale(),y=pt.y/scale();LPCWSTR id=IDC_ARROW;
-     if(x>width-17&&y>height-17)id=IDC_SIZENWSE;
-     else if((hover&&y<32&&x>width-150)||(hover&&y>=transport.y-14&&transport.hit(x,y)!=ControlHit::None))id=IDC_HAND;
-     else if(!untimed&&y>=viewportTop&&y<=viewportBottom&&x>=textX&&x<=width-12){
+     int split=splitterAt(x,y);
+     if(layoutPanel){int slot=0,module=0;id=(panelChipAt(x,y,slot,module)||panelCloseAt(x,y))?IDC_HAND:IDC_ARROW;}
+     else if(split==1)id=IDC_SIZEWE;
+     else if(split==2)id=IDC_SIZENS;
+     else if(x>width-17&&y>height-17)id=IDC_SIZENWSE;
+     else if(iconAt(x,y)>=0||(hover&&y>=transport.y-14&&transport.hit(x,y)!=ControlHit::None))id=IDC_HAND;
+     else if(!untimed&&y>=viewportTop&&y<=viewportBottom&&x>=textX&&x<=lyricRight()){
       double now=motionNow();
       for(const auto&item:groups){if(!groupVisible(item.second,now))continue;float top=item.second.y.value(now);if(y>=top-2&&y<=top+item.second.renderedHeight(item.second.zoom.value(now))){id=IDC_HAND;break;}}
      }
@@ -1191,20 +1418,25 @@ class App {
     }
     break;
    }
-   case WM_MOUSEMOVE:{float x=GET_X_LPARAM(lp)/scale();if(resizing){POINT point;GetCursorPos(&point);int w=int(clamp(resizeSize.cx+point.x-resizeStart.x,MinWindowWidth*scale(),MaxWindowWidth*scale())),h=int(clamp(resizeSize.cy+point.y-resizeStart.y,MinWindowHeight*scale(),MaxWindowHeight*scale()));if(w!=geometryPixels.cx||h!=geometryPixels.cy)SetWindowPos(hwnd,nullptr,0,0,w,h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);}else if(dragProgress){dragRatio=transport.ratio(x);update();}else if(!hover&&!through){hover=true;TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,hwnd,0};TrackMouseEvent(&event);update();}return 0;}
-   case WM_MOUSELEAVE:if(!dragProgress&&!resizing){hover=false;update();}return 0;
-   case WM_LBUTTONDOWN:{if(through)return 0;float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();bool iconZone=hover&&y<32&&x>width-150;if(playlistOpen&&!iconZone&&!(x>width-17&&y>height-17))closePlaylist();if(x>width-17&&y>height-17){resizing=true;GetCursorPos(&resizeStart);RECT r;GetWindowRect(hwnd,&r);resizeSize={r.right-r.left,r.bottom-r.top};SetCapture(hwnd);update();return 0;}if(iconZone){int i=int((x-(width-150))/24);if(i==0){command("like");}else if(i==1){requestVinylPage();}else if(i==2){togglePlaylist();}else if(i==3){setTop(!top);save();update();}else if(i==4){setThrough(true);update();}else DestroyWindow(hwnd);return 0;}
+   case WM_MOUSEMOVE:{float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();if(resizing){POINT point;GetCursorPos(&point);int w=int(clamp(resizeSize.cx+point.x-resizeStart.x,MinWindowWidth*scale(),MaxWindowWidth*scale())),h=int(clamp(resizeSize.cy+point.y-resizeStart.y,MinWindowHeight*scale(),MaxWindowHeight*scale()));if(w!=geometryPixels.cx||h!=geometryPixels.cy)SetWindowPos(hwnd,nullptr,0,0,w,h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);}else if(splitterDrag){if(splitterDrag==1)leftRatio=float(clamp((x-SlotMargin)/std::max(1.f,width-SlotMargin*2),.10,.60));else topHeight=float(clamp(y-SlotMargin,18.f,std::max(18.f,height-SlotMargin-SlotBottom-60.f)));applySlotLayout();rebuildMeta();layoutDirty=true;update();}else if(dragProgress){dragRatio=transport.ratio(x);update();}else if(!hover&&!through){hover=true;TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,hwnd,0};TrackMouseEvent(&event);update();}else if(hover&&!through&&slotLayout&&!layoutPanel){int split=splitterAt(x,y);if(split!=splitterHover){splitterHover=split;update();}}return 0;}
+   case WM_MOUSELEAVE:if(!dragProgress&&!resizing&&!splitterDrag){hover=false;splitterHover=0;update();}return 0;
+   case WM_LBUTTONDOWN:{if(through)return 0;float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();
+    if(layoutPanel){int slot=0,module=0;if(panelCloseAt(x,y)){layoutPanel=false;update();return 0;}if(panelChipAt(x,y,slot,module)){assignSlot(slot,module);return 0;}layoutPanel=false;update();return 0;}
+    int split=splitterAt(x,y);if(split){splitterDrag=split;splitterHover=split;SetCapture(hwnd);update();return 0;}
+    int icon=iconAt(x,y);bool iconZone=icon>=0;if(playlistOpen&&!iconZone&&!(x>width-17&&y>height-17))closePlaylist();if(x>width-17&&y>height-17){resizing=true;GetCursorPos(&resizeStart);RECT r;GetWindowRect(hwnd,&r);resizeSize={r.right-r.left,r.bottom-r.top};SetCapture(hwnd);update();return 0;}
+    if(iconZone){switch(icon){case 0:toggleLayoutPanel();break;case 1:command("like");break;case 2:requestVinylPage();break;case 3:togglePlaylist();break;case 4:setTop(!top);save();update();break;case 5:setThrough(true);update();break;default:DestroyWindow(hwnd);break;}return 0;}
     if(hover&&y>=transport.y-14){
      switch(transport.hit(x,y)){
       case ControlHit::Seek:if(duration>0){dragProgress=true;dragRatio=transport.ratio(x);SetCapture(hwnd);update();}break;
       case ControlHit::Previous:command("previous");break;case ControlHit::Play:command("play");break;case ControlHit::Next:command("next");break;default:break;
      }return 0;
     }
-    if(x<textX||y<32){ReleaseCapture();SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0);return 0;}
-    if(!untimed&&y>=viewportTop&&y<=viewportBottom&&x>=textX&&x<=width-12){for(const auto&item:groups){if(!groupVisible(item.second,motionNow()))continue;float top=item.second.y.value(motionNow());if(y>=top-2&&y<=top+item.second.renderedHeight(item.second.zoom.value(motionNow()))){requestSeek(std::max(0.,item.second.content->model.time-offset));update();break;}}}return 0;}
-   case WM_LBUTTONUP:if(dragProgress){requestSeek(duration*dragRatio);dragProgress=false;ReleaseCapture();update();}if(resizing)ReleaseCapture();return 0;
-   case WM_LBUTTONDBLCLK:if(GET_X_LPARAM(lp)/scale()<textX)command("play");return 0;
-   case WM_CAPTURECHANGED:{bool sized=resizing;dragProgress=false;resizing=false;POINT p;GetCursorPos(&p);ScreenToClient(hwnd,&p);hover=!through&&p.x>=0&&p.y>=0&&p.x<width*scale()&&p.y<height*scale();update();if(sized)save();return 0;}
+    if(!untimed&&y>=viewportTop&&y<=viewportBottom&&x>=textX&&x<=lyricRight()){for(const auto&item:groups){if(!groupVisible(item.second,motionNow()))continue;float top=item.second.y.value(motionNow());if(y>=top-2&&y<=top+item.second.renderedHeight(item.second.zoom.value(motionNow()))){requestSeek(std::max(0.,item.second.content->model.time-offset));update();return 0;}}}
+    ReleaseCapture();SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0);return 0;}
+   case WM_LBUTTONUP:if(splitterDrag){splitterDrag=0;splitterHover=0;ReleaseCapture();save();update();return 0;}if(dragProgress){requestSeek(duration*dragRatio);dragProgress=false;ReleaseCapture();update();}if(resizing)ReleaseCapture();return 0;
+   case WM_LBUTTONDBLCLK:{float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();if((x>=artBounds.left&&x<=artBounds.right&&y>=artBounds.top&&y<=artBounds.bottom)||x<textX)command("play");return 0;}
+   case WM_CAPTURECHANGED:{bool sized=resizing,split=splitterDrag!=0;splitterDrag=0;dragProgress=false;resizing=false;POINT p;GetCursorPos(&p);ScreenToClient(hwnd,&p);hover=!through&&p.x>=0&&p.y>=0&&p.x<width*scale()&&p.y<height*scale();update();if(sized||split)save();return 0;}
+   case WM_KEYDOWN:if(wp==VK_ESCAPE&&layoutPanel){layoutPanel=false;update();return 0;}break;
    case WM_CONTEXTMENU:{POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};if(p.x==-1)GetCursorPos(&p);menu(p);return 0;}
    case WM_ENTERSIZEMOVE:stopFrames();if(frameTimer)WaitForSingleObject(frameTimer,0);systemMoving=true;modalFrames.start(hwnd,frameTimer,FrameReady);update();return 0;
    case WM_EXITSIZEMOVE:systemMoving=false;stopFrames();modalFrames.stop();recordNormalBounds();update();save();return 0;
@@ -1216,7 +1448,7 @@ class App {
  public:
  ~App(){stopCoverWorker();}
  App(){settingsPath=env(L"MINILYRICS_SETTINGS");if(settingsPath.empty())settingsPath=env(L"LOCALAPPDATA")+L"\\MiniLyrics\\settings.json";
-  try{std::ifstream f(std::filesystem::path(settingsPath),std::ios::binary);std::string bytes((std::istreambuf_iterator<char>(f)),{});if(bytes.size()>65536)throw std::runtime_error("settings size");auto settings=JsonParser(bytes).parse();savedX=settings["X"].n(80);savedY=settings["Y"].n(80);positionInPixels=settings["PositionInPixels"].b();savedWidth=clamp(settings["Width"].n(MinWindowWidth),MinWindowWidth,MaxWindowWidth);savedHeight=clamp(settings["Height"].n(MinWindowHeight),MinWindowHeight,MaxWindowHeight);top=settings["Top"].b(true);translation=settings["Translation"].b(true);fps=settings["Fps"].n(60)==60?60:30;readBackground(settings["Background"]);currentFontSize=float(std::round(clamp(settings["FontSize"].n(::CurrentFontSize),14,36)));contextFontSize=::ContextFontSize*currentFontSize/::CurrentFontSize;translationFontSize=::TranslationFontSize*currentFontSize/::CurrentFontSize;}catch(...){}
+  try{std::ifstream f(std::filesystem::path(settingsPath),std::ios::binary);std::string bytes((std::istreambuf_iterator<char>(f)),{});if(bytes.size()>65536)throw std::runtime_error("settings size");auto settings=JsonParser(bytes).parse();savedX=settings["X"].n(80);savedY=settings["Y"].n(80);positionInPixels=settings["PositionInPixels"].b();savedWidth=clamp(settings["Width"].n(MinWindowWidth),MinWindowWidth,MaxWindowWidth);savedHeight=clamp(settings["Height"].n(MinWindowHeight),MinWindowHeight,MaxWindowHeight);top=settings["Top"].b(true);translation=settings["Translation"].b(true);fps=settings["Fps"].n(60)==60?60:30;readBackground(settings["Background"]);readLayout(settings["Layout"]);currentFontSize=float(std::round(clamp(settings["FontSize"].n(::CurrentFontSize),14,36)));contextFontSize=::ContextFontSize*currentFontSize/::CurrentFontSize;translationFontSize=::TranslationFontSize*currentFontSize/::CurrentFontSize;}catch(...){}
  }
  int run(HINSTANCE instance,int port,const std::string&token,const std::wstring&captureFile,bool demoMode){
   capturePath=captureFile;demo=demoMode;if(!demo)ownerProcess.capture();check(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,factory.put()));check(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(textFactory.put())));check(CoCreateInstance(CLSID_WICImagingFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(imaging.put())));
