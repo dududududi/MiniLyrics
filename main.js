@@ -88,7 +88,7 @@ const MINILYRICS_VERSION="0.8.3";
   'use strict';
   function createPlayerAdapter(env=root){
     let store=null,bridge=null,nativeAdapter=null,unsubscribe=null,disposed=false,starting=false,retry=null,webpackRequire=null;
-    let song=null,status='Paused',timeline=null,sequence=0,lastStoreState=null,lastVinylOpen=null,vinylEventsBound=false;
+    let song=null,status='Paused',timeline=null,sequence=0,lastStoreState=null,lastVinylOpen=null,lastLiked=null,vinylEventsBound=false;
     const events=new Map(),bindings=new Map(),eventNames=['PlayProgress','Seek','PlayState'];
     const now=()=>env.performance?.now?.()??Date.now();
     let lastAcceptedProgressAt=null,lastAcceptedSeekAt=null,bridgeSource=null;
@@ -139,7 +139,7 @@ const MINILYRICS_VERSION="0.8.3";
       return {canControl,bridgeSource,originalInitialization:'unverified',subscriptions,streamState,
         hasActualProgress:lastAcceptedProgressAt!==null,lastReceivedProgressAt:progress.lastReceivedAt,lastAcceptedProgressAt,lastAcceptedSeekAt,
         progressAgeMs:lastAcceptedProgressAt===null?null:Math.max(0,now()-lastAcceptedProgressAt),
-        timelineSource:timeline?.source??null,vinylOpen:vinylPageOpen(),control:controlState(),events:Object.fromEntries(eventNames.map(name=>[name,{...nativeStats[name]}]))};
+        timelineSource:timeline?.source??null,vinylOpen:vinylPageOpen(),liked:currentLiked(),control:controlState(),events:Object.fromEntries(eventNames.map(name=>[name,{...nativeStats[name]}]))};
     }
     const emit=(name,detail)=>{for(const fn of [...events.get(name)??[]])try{fn({detail});}catch(e){env.console?.warn('[MiniLyrics] 播放订阅处理失败',e);}};
     const sameSong=(a,b)=>!!a&&!!b&&a.trackId===b.trackId&&a.ncmId===b.ncmId&&a.songName===b.songName&&a.authorName===b.authorName&&a.cover?.url===b.cover?.url&&a.duration===b.duration;
@@ -171,6 +171,9 @@ const MINILYRICS_VERSION="0.8.3";
       if(stateChanged){status=nextStatus;lastStoreState=state;}
       if(timeline)timeline={...timeline,totalTime:song.duration};
       if(meta)emit('songChange',song);
+      if(changed)lastLiked=null;
+      const liked=currentLiked();
+      if(liked!==lastLiked){lastLiked=liked;emit('likeChange',{liked});}
       if(stateChanged)emit('playStateChange',status);
       if(sessionReady(store.getState()?.playing))resumeTrack=null;
       scheduleStartupSeek();
@@ -249,6 +252,32 @@ const MINILYRICS_VERSION="0.8.3";
       }catch(e){
         lastControl={action:'openVinylPage',route:'original-model',at:now(),error:'vinyl-dispatch-failed'};
         env.console?.warn('[MiniLyrics] 打开播放页失败',e);
+        return false;
+      }
+    }
+    function currentLiked(){
+      if(disposed||!store)return false;
+      try{
+        const state=store.getState(),p=state?.playing;
+        if(!p)return false;
+        // Voices carry their own liked flag; tracks are keyed by the online
+        // track id in the same map the play bar uses.
+        if(p.resourceType==='voice')return !!p.curVoice?.liked;
+        const key=String(p.onlineResourceId??p.resourceTrackId??'');
+        const map=state['async:hostResource']?.likeTracksMap;
+        return !!(key&&map&&map[key]);
+      }catch{return false;}
+    }
+    function toggleLike(){
+      if(disposed||!store)return false;
+      try{
+        lastControl={action:'like',route:'current-song',at:now()};
+        // "hotKey" makes the original model raise a tray balloon; the desktop
+        // lyrics scene is the correct origin and keeps the action silent.
+        return dispatch('async:hostResource/setLikeCurPlayingTrack',{from:'desktopLyric'});
+      }catch(e){
+        lastControl={action:'like',route:'current-song',at:now(),error:'like-dispatch-failed'};
+        env.console?.warn('[MiniLyrics] 喜欢当前歌曲失败',e);
         return false;
       }
     }
@@ -421,7 +450,7 @@ const MINILYRICS_VERSION="0.8.3";
     const api={version:'ncm3-v3',get ready(){return !!store&&!disposed;},getDiagnostics:diagnostics,
       getCurrentSong:()=>{sync();return song;},getPlaybackStatus:()=>status,getTimeline:()=>{bindEvents();scheduleStartupSeek();return timeline;},
       getPlaylist:playlistEntries,playPlaylistIndex,
-      openVinylPage,isVinylPageOpen:vinylPageOpen,
+      openVinylPage,isVinylPageOpen:vinylPageOpen,isCurrentLiked:currentLiked,toggleLike,
       addEventListener:(name,fn)=>{if(!events.has(name))events.set(name,new Set());events.get(name).add(fn);},
       removeEventListener:(name,fn)=>events.get(name)?.delete(fn),
       play:()=>playbackControl('playing/resume',{triggerScene:'desktopLyric'}),pause:()=>playbackControl('playing/pause',{triggerScene:'desktopLyric'}),
@@ -540,12 +569,17 @@ const MINILYRICS_VERSION="0.8.3";
       sourcePosition=null;sourcePlaying=null;sourceKind=null;lines=[];lastLyrics='';lyricMode='waiting';lastAppliedRnp=null;hostState=null;
     }
     song=next;const signature=JSON.stringify(song);
-    if(signature!==lastMeta){lastMeta=signature;send({type:'track',...song});}
+    if(signature!==lastMeta){lastMeta=signature;send({type:'track',...song});sendLiked();}
     return true;
   }
   function sendClock(seekState=''){
     send({type:'clock',songId:song.id,position:live(),playing,valid:clockValid,
       duration:song.duration,offset,seekRequest:lastSeekId,seekState});refreshStatus();
+  }
+  function sendLiked(){
+    if(!song.id)return;
+    let liked=false;try{liked=!!player?.isCurrentLiked?.();}catch{}
+    send({type:'liked',liked});
   }
   function playerTimelineFresh(){
     return !!player&&clockValid&&sourcePosition!==null&&(sourcePlaying===false||performance.now()-sourceAdvancedAt<STALE_MS);
@@ -616,6 +650,7 @@ const MINILYRICS_VERSION="0.8.3";
     if(m.action==='play'){if(player?.togglePlay)player.togglePlay();else player?.[player.getPlaybackStatus?.()==='Playing'?'pause':'play']?.();return;}
     if(m.action==='previous'||m.action==='next')player?.[m.action]?.();
     if(m.action==='playlist')return requestPlaylist();
+    if(m.action==='like'){player?.toggleLike?.();return;}
     if(m.action==='detail'){
       if(!player)return;
       if(player.isVinylPageOpen?.()){send({type:'nowplaying',open:true});return;}
@@ -647,7 +682,8 @@ const MINILYRICS_VERSION="0.8.3";
     };
     const onControlError=e=>{const own=pendingSeek;if(player===api&&own&&e.detail?.requestId===own.id&&e.detail?.songId===own.songId)failSeek(own,e.detail.reason);};
     const onVinyl=e=>{if(player===api)send({type:'nowplaying',open:!!e.detail?.open});};
-    const bindings=[['timelineUpdate',onTimeline],['songChange',onSong],['playStateChange',onPlaying],['controlError',onControlError],['vinylPageChange',onVinyl]];
+    const onLike=e=>{if(player===api)send({type:'liked',liked:!!e.detail?.liked});};
+    const bindings=[['timelineUpdate',onTimeline],['songChange',onSong],['playStateChange',onPlaying],['controlError',onControlError],['vinylPageChange',onVinyl],['likeChange',onLike]];
     for(const [name,fn]of bindings)api.addEventListener?.(name,fn);
     detachPlayer=()=>{for(const [name,fn]of bindings)api.removeEventListener?.(name,fn);};
     status='已连接';
@@ -740,6 +776,7 @@ const MINILYRICS_VERSION="0.8.3";
     send({type:'hello',token:own.token});
     if(song.id){
       send({type:'track',...song});
+      sendLiked();
       if(lastAppliedRnp)send({type:'lyrics',songId:song.id,revision:++lyricRevision,mode:lyricMode,lines});
       if(clockValid||offset!==0)sendClock();
     }

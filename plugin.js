@@ -103,12 +103,17 @@
       sourcePosition=null;sourcePlaying=null;sourceKind=null;lines=[];lastLyrics='';lyricMode='waiting';lastAppliedRnp=null;hostState=null;
     }
     song=next;const signature=JSON.stringify(song);
-    if(signature!==lastMeta){lastMeta=signature;send({type:'track',...song});}
+    if(signature!==lastMeta){lastMeta=signature;send({type:'track',...song});sendLiked();}
     return true;
   }
   function sendClock(seekState=''){
     send({type:'clock',songId:song.id,position:live(),playing,valid:clockValid,
       duration:song.duration,offset,seekRequest:lastSeekId,seekState});refreshStatus();
+  }
+  function sendLiked(){
+    if(!song.id)return;
+    let liked=false;try{liked=!!player?.isCurrentLiked?.();}catch{}
+    send({type:'liked',liked});
   }
   function playerTimelineFresh(){
     return !!player&&clockValid&&sourcePosition!==null&&(sourcePlaying===false||performance.now()-sourceAdvancedAt<STALE_MS);
@@ -179,6 +184,7 @@
     if(m.action==='play'){if(player?.togglePlay)player.togglePlay();else player?.[player.getPlaybackStatus?.()==='Playing'?'pause':'play']?.();return;}
     if(m.action==='previous'||m.action==='next')player?.[m.action]?.();
     if(m.action==='playlist')return requestPlaylist();
+    if(m.action==='like'){player?.toggleLike?.();return;}
     if(m.action==='detail'){
       if(!player)return;
       if(player.isVinylPageOpen?.()){send({type:'nowplaying',open:true});return;}
@@ -210,7 +216,8 @@
     };
     const onControlError=e=>{const own=pendingSeek;if(player===api&&own&&e.detail?.requestId===own.id&&e.detail?.songId===own.songId)failSeek(own,e.detail.reason);};
     const onVinyl=e=>{if(player===api)send({type:'nowplaying',open:!!e.detail?.open});};
-    const bindings=[['timelineUpdate',onTimeline],['songChange',onSong],['playStateChange',onPlaying],['controlError',onControlError],['vinylPageChange',onVinyl]];
+    const onLike=e=>{if(player===api)send({type:'liked',liked:!!e.detail?.liked});};
+    const bindings=[['timelineUpdate',onTimeline],['songChange',onSong],['playStateChange',onPlaying],['controlError',onControlError],['vinylPageChange',onVinyl],['likeChange',onLike]];
     for(const [name,fn]of bindings)api.addEventListener?.(name,fn);
     detachPlayer=()=>{for(const [name,fn]of bindings)api.removeEventListener?.(name,fn);};
     status='已连接';
@@ -303,6 +310,7 @@
     send({type:'hello',token:own.token});
     if(song.id){
       send({type:'track',...song});
+      sendLiked();
       if(lastAppliedRnp)send({type:'lyrics',songId:song.id,revision:++lyricRevision,mode:lyricMode,lines});
       if(clockValid||offset!==0)sendClock();
     }
