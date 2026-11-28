@@ -197,13 +197,13 @@ class LayeredSurface {
   RECT area{0,0,LONG(w),LONG(h)};
   return SUCCEEDED(render->BindDC(memory,&area));
  }
- bool present(HWND hwnd){
+ bool present(HWND hwnd,BYTE alpha=255){
   if(!render||!memory||!bitmap)return false;
   RECT window{};if(!GetWindowRect(hwnd,&window))return false;
   if(!screen){screen=GetDC(nullptr);if(!screen)return false;}
   POINT destination{window.left,window.top},source{0,0};
   SIZE size{LONG(pixelWidth),LONG(pixelHeight)};
-  BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
+  BLENDFUNCTION blend{AC_SRC_OVER,0,alpha,AC_SRC_ALPHA};
   return UpdateLayeredWindow(hwnd,screen,&destination,&size,memory,&source,0,&blend,ULW_ALPHA)!=FALSE;
  }
 };
@@ -222,17 +222,20 @@ class App {
  std::vector<std::shared_ptr<LyricLayout>> lyricLayouts;
  size_t nextLayoutToWarm=0;
  static constexpr UINT_PTR LayoutWarmupTimer=5;
- static constexpr UINT_PTR PlaylistRefreshTimer=6,VinylConfirmTimer=7,PlaylistWatchTimer=1,PlaylistAnimTimer=8;
+ static constexpr UINT_PTR PlaylistRefreshTimer=6,VinylConfirmTimer=7,PlaylistWatchTimer=1,PlaylistAnimTimer=8,SecondaryAnimTimer=9;
+ static constexpr double OpenAnimMs=170;
  static constexpr float PlaylistRowHeight=44,PlaylistHeaderHeight=46;
  struct PlaylistItem {std::wstring title,artist;std::string resourceId;double duration=0;int index=0;bool current=false;};
  std::vector<PlaylistItem> playlist;int playlistCurrent=-1;
  Com<IDWriteTextFormat> playlistHeaderFormat,playlistTitleFormat,playlistMetaFormat;
  std::unique_ptr<LayeredSurface> playlistTarget;Graphics playlistGraphics;HWND playlistHwnd=nullptr;
  float playlistWidth=360,playlistHeight=180;int playlistScroll=0,playlistHover=-1;
- bool playlistOpen=false,playlistLoading=false,playlistUnsupported=false,playlistDrag=false,playlistMouseDown=false,playlistDragMoved=false,playlistTracking=false,playlistLocateHover=false;
+ bool playlistOpen=false,playlistLoading=false,playlistUnsupported=false,playlistDrag=false,playlistMouseDown=false,playlistDragMoved=false,playlistTracking=false,playlistLocateHover=false,playlistLocatePress=false;
  LineTrack playlistScrollTrack;
+ double playlistOpenAt=0,panelOpenAt=0;
+ bool playlistOpening=false,panelOpening=false;
  POINT playlistDragStart{};int playlistDragScroll=0;double playlistRevision=0;
- LyricClock indicatorMotion;double lastIndicatorTime=0;
+ LyricClock indicatorMotion;double lastIndicatorTime=0;LineTrack browseDotsFade{1.f,1.f};
  LyricClock motion;bool transitionActive=false,snapRow=false,testWall=false,freezePlayback=false,layoutDirty=true,stagger=true;double testWallMs=0;int focusIndex=-999,lineCurve=0,browseIndex=-1,wheelRemainder=0;double browseUntil=0;bool returnFromBrowse=false,manualTransition=false,manualLayoutPending=false;float viewportTop=32,viewportBottom=98,layoutAnchor=44,mainRowHeight=28;uint64_t groupSerial=0,layoutChanges=0;
  Com<ID2D1PathGeometry> playGeometry,likeGeometry;
  std::vector<Line> lines;CoverData cover;BackgroundSettings background;BackgroundClock backgroundClock;FluidBackground fluid;
@@ -353,7 +356,19 @@ class App {
  int playlistVisibleRows()const{return std::max(1,int((playlistHeight-PlaylistHeaderHeight-6)/PlaylistRowHeight));}
  int playlistMaxScroll()const{return std::max(0,int(playlist.size())-playlistVisibleRows());}
  float playlistVisualScroll()const{return playlistScrollTrack.value(animationWall());}
- bool playlistLocateHit(float x,float y)const{return y<42&&x>=playlistWidth-64&&x<playlistWidth-38;}
+ float openProgress(double at)const{return float(lyricEase(unit((nowMs()-at)/OpenAnimMs)));}
+ float playlistOpenProgress()const{return playlistOpening?openProgress(playlistOpenAt):1.f;}
+ float panelOpenProgress()const{return panelOpening?openProgress(panelOpenAt):1.f;}
+ bool playlistLocateVisible()const{
+  if(playlistCurrent<0||playlist.empty())return false;
+  float top=PlaylistHeaderHeight+(playlistCurrent-playlistVisualScroll())*PlaylistRowHeight;
+  return !(top>=PlaylistHeaderHeight-.5f&&top+PlaylistRowHeight<=playlistHeight-5);
+ }
+ bool playlistLocateHit(float x,float y)const{
+  if(!playlistLocateVisible())return false;
+  float dx=x-(playlistWidth-28),dy=y-(playlistHeight-28);
+  return dx*dx+dy*dy<=18*18;
+ }
  void snapPlaylistScroll(){playlistScrollTrack.snap(float(playlistScroll));}
  void animatePlaylistScroll(int target){
   target=int(clamp(target,0,playlistMaxScroll()));playlistScroll=target;
@@ -403,7 +418,7 @@ class App {
  }
  void closePlaylist(){
   if(!playlistOpen&&!playlistHwnd)return;
-  playlistOpen=false;playlistDrag=false;playlistDragMoved=false;playlistHover=-1;playlistLocateHover=false;playlistLoading=false;playlistMouseDown=false;playlistTracking=false;
+  playlistOpen=false;playlistDrag=false;playlistDragMoved=false;playlistHover=-1;playlistLocateHover=false;playlistLocatePress=false;playlistLoading=false;playlistMouseDown=false;playlistTracking=false;playlistOpening=false;
   KillTimer(hwnd,PlaylistRefreshTimer);KillTimer(hwnd,PlaylistAnimTimer);
   if(playlistHwnd){HWND window=playlistHwnd;playlistHwnd=nullptr;KillTimer(window,PlaylistWatchTimer);DestroyWindow(window);}
   playlistTarget.reset();playlistGraphics.clear();
@@ -411,11 +426,11 @@ class App {
  }
  void togglePlaylist(){
   if(playlistOpen){closePlaylist();return;}
-  playlistOpen=true;playlistHover=-1;playlistLocateHover=false;playlistLoading=playlist.empty();
+  playlistOpen=true;playlistHover=-1;playlistLocateHover=false;playlistLoading=playlist.empty();playlistOpenAt=nowMs();playlistOpening=true;
   layoutPlaylistWindow(true);snapPlaylistScroll();createPlaylistWindow();positionPlaylist();
   if(playlistHwnd)ShowWindow(playlistHwnd,SW_SHOWNOACTIVATE);
   paintPlaylist();
-  SetTimer(hwnd,PlaylistRefreshTimer,2000,nullptr);
+  SetTimer(hwnd,PlaylistRefreshTimer,2000,nullptr);SetTimer(hwnd,PlaylistAnimTimer,8,nullptr);
   command("playlist");update();
  }
  void selectPlaylistRow(int row){
@@ -458,13 +473,19 @@ class App {
    drawPlaylist(playlistGraphics);
    HRESULT hr=playlistTarget->EndDraw();
    if(hr==D2DERR_RECREATE_TARGET||FAILED(hr)){playlistGraphics.clear();playlistTarget.reset();}
-   else if(IsWindowVisible(playlistHwnd)&&!playlistTarget->present(playlistHwnd)){playlistGraphics.clear();playlistTarget.reset();}
+   else if(IsWindowVisible(playlistHwnd)&&!playlistTarget->present(playlistHwnd,BYTE(std::lround(255.f*(playlistOpening?playlistOpenProgress():1.f))))){playlistGraphics.clear();playlistTarget.reset();}
   }catch(...){playlistGraphics.clear();playlistTarget.reset();}
   EndPaint(playlistHwnd,&ps);
  }
  void drawPlaylist(Graphics&g){
   auto*t=g.target;
   t->Clear(D2D1::ColorF(0,0,0,0));
+  float open=playlistOpenProgress();
+  D2D1_MATRIX_3X2_F savedTransform;t->GetTransform(&savedTransform);
+  if(open<1){
+   float scale=.965f+.035f*open,dy=(1-open)*7.f;
+   t->SetTransform(D2D1::Matrix3x2F::Scale(scale,scale,D2D1::Point2F(playlistWidth*.5f,playlistHeight*.5f))*D2D1::Matrix3x2F::Translation(0,dy)*savedTransform);
+  }
   auto card=D2D1::RoundedRect(D2D1::RectF(.5f,.5f,std::max(1.f,playlistWidth-.5f),std::max(1.f,playlistHeight-.5f)),17,17);
   t->FillRoundedRectangle(card,g.gradient.get());
   g.brush->SetColor(D2D1::ColorF(0,0,0,.17f));t->FillRoundedRectangle(card,g.brush.get());
@@ -473,10 +494,6 @@ class App {
   text(g,header,18,12,D2D1::ColorF(.95f,.96f,.99f));
   auto count=layout(playlistLoading?L"读取中":std::to_wstring(playlist.size())+L" 首",playlistMetaFormat.get());
   text(g,count,std::max(18.f,playlistWidth-72-count.width),17,D2D1::ColorF(.72f,.75f,.84f),.9f);
-  float locateX=playlistWidth-51,locateY=21;
-  g.brush->SetColor(D2D1::ColorF(1,1,1,playlistLocateHover?.92f:.62f));
-  t->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(locateX,locateY),6,6),g.brush.get(),1.3f);
-  t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(locateX,locateY),1.8f,1.8f),g.brush.get());
   g.brush->SetColor(D2D1::ColorF(1,1,1,.62f));
   float closeX=playlistWidth-24,closeY=21;
   t->DrawLine(D2D1::Point2F(closeX-4,closeY-4),D2D1::Point2F(closeX+4,closeY+4),g.brush.get(),1.4f);
@@ -523,6 +540,19 @@ class App {
    g.brush->SetColor(D2D1::ColorF(1,1,1,.18f));t->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(playlistWidth-6,trackTop,playlistWidth-3.5f,trackTop+trackHeight),1.25f,1.25f),g.brush.get());
    g.brush->SetColor(D2D1::ColorF(1,1,1,.42f));t->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(playlistWidth-6,trackTop+offset,playlistWidth-3.5f,trackTop+offset+thumb),1.25f,1.25f),g.brush.get());
   }
+  if(playlistLocateVisible()){
+   // NetEase-style locate reticle on a frosted, semi-transparent floating button.
+   float cx=playlistWidth-28,cy=playlistHeight-28;bool hi=playlistLocateHover;
+   g.brush->SetColor(D2D1::ColorF(0,0,0,hi?.28f:.22f));t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy+1.5f),15.5f,15.5f),g.brush.get());
+   g.brush->SetColor(D2D1::ColorF(1,1,1,hi?.42f:.32f));t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy),14.5f,14.5f),g.brush.get());
+   g.brush->SetColor(D2D1::ColorF(1,1,1,hi?.52f:.40f));t->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy),14.5f,14.5f),g.brush.get(),1);
+   g.brush->SetColor(D2D1::ColorF(1,1,1,hi?.98f:.90f));
+   t->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy),5.6f,5.6f),g.brush.get(),1.3f);
+   t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx,cy),1.7f,1.7f),g.brush.get());
+   for(int k=0;k<4;k++){float a=float(k)*3.14159265f*.5f,c=std::cos(a),s=std::sin(a);
+    t->DrawLine(D2D1::Point2F(cx+c*8.4f,cy+s*8.4f),D2D1::Point2F(cx+c*10.9f,cy+s*10.9f),g.brush.get(),1.3f);}
+  }
+  t->SetTransform(savedTransform);
  }
  LRESULT playlistMessage(HWND window,UINT msg,WPARAM wp,LPARAM lp){
   switch(msg){
@@ -557,13 +587,13 @@ class App {
    case WM_LBUTTONDOWN:{
     float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();
     if(x>playlistWidth-38&&y<42){closePlaylist();return 0;}
-    if(playlistLocateHit(x,y)){if(playlistCurrent>=0)animatePlaylistScroll(playlistCurrent-playlistVisibleRows()/2);return 0;}
+    if(playlistLocateHit(x,y)){playlistLocatePress=true;SetCapture(window);if(playlistCurrent>=0)animatePlaylistScroll(playlistCurrent-playlistVisibleRows()/2);return 0;}
     SetCapture(window);playlistDrag=true;playlistDragMoved=false;playlistDragStart={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};playlistDragScroll=playlistScroll;
     return 0;
    }
    case WM_LBUTTONUP:{
-    bool dragged=playlistDragMoved;playlistDrag=false;playlistDragMoved=false;ReleaseCapture();
-    if(!dragged)selectPlaylistRow(playlistRowAt(GET_X_LPARAM(lp)/scale(),GET_Y_LPARAM(lp)/scale()));
+    bool dragged=playlistDragMoved,locate=playlistLocatePress;playlistDrag=false;playlistDragMoved=false;playlistLocatePress=false;ReleaseCapture();
+    if(!dragged&&!locate)selectPlaylistRow(playlistRowAt(GET_X_LPARAM(lp)/scale(),GET_Y_LPARAM(lp)/scale()));
     return 0;
    }
    case WM_MOUSEWHEEL:{
@@ -573,7 +603,7 @@ class App {
    }
    case WM_TIMER:if(wp==PlaylistWatchTimer)watchPlaylistOutside();return 0;
    case WM_DESTROY:{
-    KillTimer(window,PlaylistWatchTimer);playlistHwnd=nullptr;playlistOpen=false;playlistDrag=false;playlistDragMoved=false;playlistLocateHover=false;
+    KillTimer(window,PlaylistWatchTimer);playlistHwnd=nullptr;playlistOpen=false;playlistDrag=false;playlistDragMoved=false;playlistLocateHover=false;playlistLocatePress=false;
     playlistTarget.reset();playlistGraphics.clear();KillTimer(hwnd,PlaylistRefreshTimer);KillTimer(hwnd,PlaylistAnimTimer);
     if(!closing)update();
     return 0;
@@ -754,7 +784,7 @@ class App {
   width=std::max(1.f,float(rect.right)/scale());height=std::max(1.f,float(rect.bottom)/scale());
   miniMode=width<=400.f||height<=170.f;
   if(miniMode){
-   layoutPanel=false;splitterDrag=0;splitterHover=0;slotLayout=false;
+   layoutPanel=false;panelOpening=false;KillTimer(hwnd,SecondaryAnimTimer);splitterDrag=0;splitterHover=0;slotLayout=false;
    auto art=coverGeometry(rect.right,rect.bottom,scale());artSize=art.side;artRadius=art.radius;
    artBounds=D2D1::RectF(art.left,art.top,art.left+art.side,art.top+art.side);textX=artBounds.right+16;transport=transportGeometry(width,height,textX,scale());
    viewportTop=32;viewportBottom=std::min(height-28,transport.y-14);
@@ -858,7 +888,13 @@ class App {
     text(g,w.layout,wx,originY-f.lift,D2D1::ColorF(D2D1::ColorF::White),f.alpha*r.opacity);
    }
   }
-  if(indicatorVisible(r))drawInterludeAt(g,r.dots,originX,originY,time,r.content->model.time,interludeDuration(r.content->model,id),indicatorNow(),r.mainAlpha.value(now)*r.opacity);
+  if(indicatorVisible(r)){
+   // Leading/trailing interludes sit outside the browsable range and are pinned to the
+   // anchor while scrolling; fade their dots instead of hiding them abruptly.
+   float fade=1.f;
+   if(browseIndex>=0){auto bounds=browseBounds();if(id<bounds.first||id>bounds.second)fade=float(clamp(browseDotsFade.value(animationWall()),0.,1.));}
+   if(fade>.001f)drawInterludeAt(g,r.dots,originX,originY,time,r.content->model.time,interludeDuration(r.content->model,id),indicatorNow(),fade*r.mainAlpha.value(now)*r.opacity);
+  }
   if(r.translated){float subX=originX-std::max(0.f,r.content->subtitle.width*zoom-available)*timedHorizontalPhase(r,time,id)/zoom;text(g,r.content->subtitle,subX,originY+r.subtitleOffset(1.f),D2D1::ColorF(D2D1::ColorF::White),(staticPreview()?(id==focusIndex?.8f:.4f):r.subAlpha.value(now))*r.opacity);}
   if(scaled)g.target->SetTransform(transform);
  }
@@ -885,12 +921,12 @@ class App {
   g.backgroundBrush->SetTransform(D2D1::Matrix3x2F::Scale(width/FluidBackground::width,height/FluidBackground::height));g.target->FillRoundedRectangle(card,g.backgroundBrush.get());
  }
  void drawLyricsAt(Graphics&g,double time,double now){
-  float y=lyricAnchor();double dotsNow=indicatorNow();
-  if(!flight.rows.empty()){if(flight.prelude&&preludeDots.visible(dotsNow))drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,dotsNow);}
+  float y=lyricAnchor();double dotsNow=indicatorNow();float dotsFade=float(clamp(browseDotsFade.value(animationWall()),0.,1.));
+  if(!flight.rows.empty()){if(dotsFade>.001f&&flight.prelude&&preludeDots.visible(dotsNow))drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,dotsNow,dotsFade);}
   else switch(lyricView()){
    case LyricView::Waiting:text(g,placeholder,textX,y,D2D1::ColorF(D2D1::ColorF::White));return;
    case LyricView::StaticPreview:break;
-   case LyricView::Prelude:drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,dotsNow);break;
+   case LyricView::Prelude:if(dotsFade>.001f)drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,dotsNow,dotsFade);break;
    case LyricView::Rows:break;
   }
   for(const auto&item:groups)if(groupVisible(item.second,now))drawGroupAt(g,item.second,item.first,time,now);
@@ -1069,6 +1105,9 @@ class App {
  void drawLayoutPanel(Graphics&g){
   if(!layoutPanel)return;
   auto*t=g.target;auto p=panelGeometry();auto*format=playlistMetaFormat.get();auto card=D2D1::RoundedRect(p.card,14,14);
+  float open=panelOpenProgress();
+  D2D1_MATRIX_3X2_F savedTransform;t->GetTransform(&savedTransform);
+  if(open<1){float scale=.955f+.045f*open;t->SetTransform(D2D1::Matrix3x2F::Scale(scale,scale,D2D1::Point2F((p.card.left+p.card.right)*.5f,(p.card.top+p.card.bottom)*.5f))*D2D1::Matrix3x2F::Translation(0,(1-open)*6.f)*savedTransform);}
   g.brush->SetColor(D2D1::ColorF(.09f,.10f,.14f,.98f));t->FillRoundedRectangle(card,g.brush.get());
   g.brush->SetColor(D2D1::ColorF(.62f,.65f,.80f,.6f));t->DrawRoundedRectangle(card,g.brush.get(),1);
   g.brush->SetColor(D2D1::ColorF(1,1,1,.55f));
@@ -1105,6 +1144,7 @@ class App {
    float center=(m.right+pl.left)*.5f;
    text(g,valueLayout,center-valueLayout.width*.5f,(m.top+m.bottom-valueLayout.height)*.5f,D2D1::ColorF(.90f,.92f,.97f));
   }
+  t->SetTransform(savedTransform);
  }
  void stopFrames(){if(frameRunning||frameArmed){KillTimer(hwnd,1);if(frameTimer)CancelWaitableTimer(frameTimer);}frameArmed=false;frameRunning=false;frameDeadline=0;}
  void setRenderVisible(bool visible){
@@ -1152,7 +1192,7 @@ class App {
   if(!flight.rows.empty()){
    if(flight.rows.size()!=lines.size())flight=LyricFlight();
    else{int desired=std::max(0,index<0?preludePreview:rowAt(time+(playing&&valid&&stagger?200:0)));if(desired!=flight.focus||flight.playbackIndex!=index)beginFlight(desired,index);if(actualChanged)roles();applyFlight(animationWall());snapRow=false;returnFromBrowse=false;transitionActive=false;
-    if(flight.running(animationWall())){updateIndicators();InvalidateRect(hwnd,nullptr,FALSE);schedule();return;}flight=LyricFlight();layoutDirty=true;
+    if(flight.running(animationWall())){browseDotsFade.target(browseIndex>=0?0.f:1.f,animationWall(),0,200,0);updateIndicators();InvalidateRect(hwnd,nullptr,FALSE);schedule();return;}flight=LyricFlight();layoutDirty=true;
    }
   }
   // A layout snap (including a small clock correction across a line boundary)
@@ -1184,6 +1224,7 @@ class App {
   }
   bool layoutActive=false;for(const auto&item:groups){const auto&g=item.second;layoutActive=layoutActive||g.y.active(now)||g.zoom.active(now);}
   manualTransition=manualTransition&&layoutActive;manualLayoutPending=false;
+  browseDotsFade.target(browseIndex>=0?0.f:1.f,animationWall(),0,200,0);
   motion.setRunning(renderVisible&&((valid&&!untimed&&playing)||manualTransition),animationWall());
   InvalidateRect(hwnd,nullptr,FALSE);schedule();
  }
@@ -1410,7 +1451,7 @@ class App {
   if(j["Left"].kind==Json::Number)leftRatio=float(clamp(j["Left"].n(),0.12,0.6));
   if(j["Top"].kind==Json::Number)topHeight=float(clamp(j["Top"].n(),18,400));
  }
- void toggleLayoutPanel(){if(miniMode)return;layoutPanel=!layoutPanel;splitterHover=0;if(layoutPanel)closePlaylist();update();}
+ void toggleLayoutPanel(){if(miniMode)return;layoutPanel=!layoutPanel;splitterHover=0;if(layoutPanel){closePlaylist();panelOpenAt=nowMs();panelOpening=true;SetTimer(hwnd,SecondaryAnimTimer,8,nullptr);}else{panelOpening=false;KillTimer(hwnd,SecondaryAnimTimer);}update();}
  void assignSlot(int slot,int module){
   if(miniMode)return;int from=slotOfModule(module);if(from<0||from==slot)return;
   int displaced=slotModule[slot];slotModule[slot]=slotModule[from];slotModule[from]=displaced;
@@ -1430,7 +1471,7 @@ class App {
    case WM_WINDOWPOSCHANGED:{auto result=DefWindowProcW(hwnd,msg,wp,lp);setRenderVisible(IsWindowVisible(hwnd)&&!IsIconic(hwnd));if(playlistOpen)positionPlaylist();return result;}
    case WM_SIZE:if(wp==SIZE_MINIMIZED){closePlaylist();setRenderVisible(false);return 0;}if(wp!=SIZE_MAXHIDE&&wp!=SIZE_MAXSHOW&&factory&&textFactory&&hwnd&&geometry()){if(playlistOpen)closePlaylist();update();if(resizing&&renderVisible)UpdateWindow(hwnd);}return 0;
    case WM_DPICHANGED:{closePlaylist();dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
-   case WM_TIMER:if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();else if(wp==PlaylistAnimTimer){double now=animationWall();if(playlistOpen&&playlistHwnd&&playlistScrollTrack.active(now))paintPlaylist();else{KillTimer(hwnd,PlaylistAnimTimer);if(playlistOpen&&playlistHwnd)paintPlaylist();}}else if(wp==VinylConfirmTimer){vinylRequested=false;KillTimer(hwnd,VinylConfirmTimer);}else if(wp==PlaylistRefreshTimer){if(playlistOpen)command("playlist");else KillTimer(hwnd,PlaylistRefreshTimer);}return 0;
+   case WM_TIMER:if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();else if(wp==PlaylistAnimTimer){double now=animationWall();bool scroll=playlistOpen&&playlistHwnd&&playlistScrollTrack.active(now);if(playlistOpen&&playlistHwnd&&(scroll||playlistOpening)){paintPlaylist();if(playlistOpening&&playlistOpenProgress()>=1){playlistOpening=false;paintPlaylist();}if(!scroll&&!playlistOpening)KillTimer(hwnd,PlaylistAnimTimer);}else{KillTimer(hwnd,PlaylistAnimTimer);if(playlistOpen&&playlistHwnd)paintPlaylist();}}else if(wp==SecondaryAnimTimer){if(layoutPanel&&panelOpening&&panelOpenProgress()<1)update();else{panelOpening=false;KillTimer(hwnd,SecondaryAnimTimer);update();}}else if(wp==VinylConfirmTimer){vinylRequested=false;KillTimer(hwnd,VinylConfirmTimer);}else if(wp==PlaylistRefreshTimer){if(playlistOpen)command("playlist");else KillTimer(hwnd,PlaylistRefreshTimer);}return 0;
    case WM_MOUSEWHEEL:{
     if(through||dragProgress||resizing||layoutPanel||lines.empty())return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/scale(),y=p.y/scale();
     if(x<textX||x>lyricRight()||y<viewportTop||y>viewportBottom)return 0;
@@ -1478,7 +1519,7 @@ class App {
    case WM_ENTERSIZEMOVE:stopFrames();if(frameTimer)WaitForSingleObject(frameTimer,0);systemMoving=true;modalFrames.start(hwnd,frameTimer,FrameReady);update();return 0;
    case WM_EXITSIZEMOVE:systemMoving=false;stopFrames();modalFrames.stop();recordNormalBounds();update();save();return 0;
    case WM_CLOSE:DestroyWindow(hwnd);return 0;
-   case WM_DESTROY:try{if(bridge)bridge->finish();}catch(...){}closing=true;closePlaylist();systemMoving=false;stopFrames();modalFrames.stop();save();KillTimer(hwnd,1);KillTimer(hwnd,2);KillTimer(hwnd,3);KillTimer(hwnd,4);KillTimer(hwnd,LayoutWarmupTimer);KillTimer(hwnd,PlaylistRefreshTimer);KillTimer(hwnd,PlaylistAnimTimer);KillTimer(hwnd,VinylConfirmTimer);stopCoverWorker();PostQuitMessage(0);return 0;
+   case WM_DESTROY:try{if(bridge)bridge->finish();}catch(...){}closing=true;closePlaylist();systemMoving=false;stopFrames();modalFrames.stop();save();KillTimer(hwnd,1);KillTimer(hwnd,2);KillTimer(hwnd,3);KillTimer(hwnd,4);KillTimer(hwnd,LayoutWarmupTimer);KillTimer(hwnd,PlaylistRefreshTimer);KillTimer(hwnd,PlaylistAnimTimer);KillTimer(hwnd,SecondaryAnimTimer);KillTimer(hwnd,VinylConfirmTimer);stopCoverWorker();PostQuitMessage(0);return 0;
   }return DefWindowProcW(hwnd,msg,wp,lp);
  }
  static LRESULT CALLBACK procedure(HWND window,UINT msg,WPARAM wp,LPARAM lp){App*app=reinterpret_cast<App*>(GetWindowLongPtrW(window,GWLP_USERDATA));if(msg==WM_NCCREATE){app=static_cast<App*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);app->hwnd=window;SetWindowLongPtrW(window,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(app));}if(app){try{return app->message(msg,wp,lp);}catch(...){app->error="window-message-failed";}}return DefWindowProcW(window,msg,wp,lp);}
