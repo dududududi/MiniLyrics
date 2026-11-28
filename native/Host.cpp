@@ -254,7 +254,10 @@ class App {
  // Long-press module drag: a short press is replayed on release, a long press
  // lifts the module and swaps it with the slot under the cursor on drop.
  struct SlotSwap {int a=-1,b=-1;D2D1_RECT_F fromA{},toA{},fromB{},toB{};LineTrack p;};
- bool modulePress=false,moduleDragging=false;int pressSlot=-1,pressAction=0,pressIcon=-1;double pressSeek=-1;float pressX=0,pressY=0,dragX=0,dragY=0;int dragTargetSlot=-1;SlotSwap slotSwap;
+ // The drop highlight glides between slots (PowerPoint-morph style) instead of
+ // jumping when the pointer enters a different slot.
+ struct DragHighlight {D2D1_RECT_F from{},to{};LineTrack p;bool visible=false;};
+ bool modulePress=false,moduleDragging=false;int pressSlot=-1,pressAction=0,pressIcon=-1;double pressSeek=-1;float pressX=0,pressY=0,dragX=0,dragY=0;int dragTargetSlot=-1;SlotSwap slotSwap;DragHighlight dragHighlight;int dragHighlightSlot=-1;
  float lyricsRight=348,lyricsCenterY=65;
  Layout metaVertical;
  bool seekPending=false;uint64_t seekSerial=0,seekRequest=0;double seekStarted=0,seekFallback=0;
@@ -280,7 +283,14 @@ class App {
  bool swapAnimating()const{return slotSwap.a>=0&&slotSwap.p.active(animationWall());}
  // Drop any pending press/drag without replaying the click and without
  // touching the mouse capture (used by WM_CAPTURECHANGED and resize paths).
- void clearModulePress(){modulePress=moduleDragging=false;pressSlot=-1;pressAction=0;pressIcon=-1;pressSeek=-1;dragTargetSlot=-1;KillTimer(hwnd,LongPressTimer);}
+ void clearModulePress(){modulePress=moduleDragging=false;pressSlot=-1;pressAction=0;pressIcon=-1;pressSeek=-1;dragTargetSlot=-1;dragHighlight.visible=false;dragHighlight.p.snap(0);dragHighlightSlot=-1;KillTimer(hwnd,LongPressTimer);}
+ void morphDragHighlight(int slot){
+  if(!dragHighlight.visible||slot<0||slot==dragHighlightSlot)return;
+  double now=animationWall();
+  dragHighlight.from=lerpRect(dragHighlight.from,dragHighlight.to,dragHighlight.p.value(now));
+  dragHighlight.to=slotRects[slot];dragHighlight.p.snap(0);dragHighlight.p.target(1,now,0,200,0);
+  dragHighlightSlot=slot;
+ }
  static D2D1_RECT_F lerpRect(const D2D1_RECT_F&a,const D2D1_RECT_F&b,float p){return D2D1::RectF(mixf(a.left,b.left,p),mixf(a.top,b.top,p),mixf(a.right,b.right,p),mixf(a.bottom,b.bottom,p));}
  static D2D1_RECT_F squareIn(const D2D1_RECT_F&r){float side=std::min(r.right-r.left,r.bottom-r.top),cx=(r.left+r.right)*.5f,cy=(r.top+r.bottom)*.5f;return D2D1::RectF(cx-side*.5f,cy-side*.5f,cx+side*.5f,cy+side*.5f);}
  static D2D1_RECT_F animatedCoverRect(const D2D1_RECT_F&a,const D2D1_RECT_F&b,float p){return lerpRect(squareIn(a),squareIn(b),p);}
@@ -1017,13 +1027,12 @@ class App {
  void endModuleDraw(Graphics&g,bool active,const D2D1_MATRIX_3X2_F&base){if(!active)return;g.target->PopAxisAlignedClip();g.target->SetTransform(base);}
  void drawDragOverlay(Graphics&g){
   if(!moduleDragging||pressSlot<0)return;auto*t=g.target;
+  // The lifted source stays dimmed while its highlight glides to the target.
   const auto&src=slotRects[pressSlot];g.brush->SetColor(D2D1::ColorF(0,0,0,.28f));t->FillRoundedRectangle(D2D1::RoundedRect(src,12,12),g.brush.get());
-  if(dragTargetSlot>=0&&dragTargetSlot!=pressSlot){
-   const auto&dst=slotRects[dragTargetSlot];
+  if(dragHighlight.visible){
+   float p=dragHighlight.p.value(animationWall());auto dst=lerpRect(dragHighlight.from,dragHighlight.to,p);
    g.brush->SetColor(D2D1::ColorF(1,1,1,.06f));t->FillRoundedRectangle(D2D1::RoundedRect(dst,12,12),g.brush.get());
    g.brush->SetColor(D2D1::ColorF(1,1,1,.5f));t->DrawRoundedRectangle(D2D1::RoundedRect(dst,12,12),g.brush.get(),1.5f);
-   Layout hint=layout(moduleLabel(slotModule[pressSlot]),playlistMetaFormat.get());
-   text(g,hint,(dst.left+dst.right-hint.width)*.5f,(dst.top+dst.bottom-hint.height)*.5f,D2D1::ColorF(1,1,1),.45f);
   }
   Layout chip=layout(moduleLabel(slotModule[pressSlot]),playlistMetaFormat.get());
   float w=chip.width+18,h=chip.height+10,x=float(clamp(dragX+12.f,8.f,width-w-8.f)),y=float(clamp(dragY-10.f,8.f,height-h-8.f));
@@ -1215,7 +1224,7 @@ class App {
  }
  void schedule(){
   if(!renderVisible){stopFrames();return;}
-  double time=current()+offset,next=200;bool swapping=swapAnimating();bool active=manualTransition||swapping||(playing&&valid&&(transitionActive||lyricView()==LyricView::Prelude));
+  double time=current()+offset,next=200;bool swapping=swapAnimating()||dragHighlight.p.active(animationWall());bool active=manualTransition||swapping||(playing&&valid&&(transitionActive||lyricView()==LyricView::Prelude));
   if(playing&&valid&&!untimed&&index+1<int(lines.size())){next=std::min(next,std::max(1.,lines[index+1].time-time));if(browseIndex<0&&stagger&&focusIndex<=index)next=std::min(next,std::max(1.,lines[index+1].time-time-200));}
   if(playing&&valid&&!untimed)for(const auto&item:groups){const auto&g=item.second;if(!groupVisible(g,motionNow()))continue;const auto&line=g.content->model;
    if(indicatorVisible(g))active=true;
@@ -1559,7 +1568,7 @@ class App {
    case WM_WINDOWPOSCHANGED:{auto result=DefWindowProcW(hwnd,msg,wp,lp);setRenderVisible(IsWindowVisible(hwnd)&&!IsIconic(hwnd));if(playlistOpen)positionPlaylist();return result;}
    case WM_SIZE:if(wp==SIZE_MINIMIZED){closePlaylist();setRenderVisible(false);return 0;}if(wp!=SIZE_MAXHIDE&&wp!=SIZE_MAXSHOW&&factory&&textFactory&&hwnd&&geometry()){if(playlistOpen)closePlaylist();update();if(resizing&&renderVisible)UpdateWindow(hwnd);}return 0;
    case WM_DPICHANGED:{closePlaylist();dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
-   case WM_TIMER:if(wp==LongPressTimer){KillTimer(hwnd,LongPressTimer);if(modulePress&&!moduleDragging&&slotLayout&&!miniMode&&!layoutPanel){moduleDragging=true;pressAction=0;dragX=pressX;dragY=pressY;dragTargetSlot=pressSlot;update();}return 0;}if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();else if(wp==PlaylistAnimTimer){double now=animationWall();bool scroll=playlistOpen&&playlistHwnd&&playlistScrollTrack.active(now);if(playlistOpen&&playlistHwnd&&(scroll||playlistOpening)){paintPlaylist();if(playlistOpening&&playlistOpenProgress()>=1){playlistOpening=false;paintPlaylist();}if(!scroll&&!playlistOpening)KillTimer(hwnd,PlaylistAnimTimer);}else{KillTimer(hwnd,PlaylistAnimTimer);if(playlistOpen&&playlistHwnd)paintPlaylist();}}else if(wp==SecondaryAnimTimer){if(layoutPanel&&panelOpening&&panelOpenProgress()<1)update();else{panelOpening=false;KillTimer(hwnd,SecondaryAnimTimer);update();}}else if(wp==VinylConfirmTimer){vinylRequested=false;KillTimer(hwnd,VinylConfirmTimer);}else if(wp==PlaylistRefreshTimer){if(playlistOpen)command("playlist");else KillTimer(hwnd,PlaylistRefreshTimer);}return 0;
+   case WM_TIMER:if(wp==LongPressTimer){KillTimer(hwnd,LongPressTimer);if(modulePress&&!moduleDragging&&slotLayout&&!miniMode&&!layoutPanel){moduleDragging=true;pressAction=0;dragX=pressX;dragY=pressY;dragTargetSlot=pressSlot;dragHighlight.visible=true;dragHighlightSlot=pressSlot;dragHighlight.from=dragHighlight.to=slotRects[pressSlot];dragHighlight.p.snap(1);update();}return 0;}if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();else if(wp==PlaylistAnimTimer){double now=animationWall();bool scroll=playlistOpen&&playlistHwnd&&playlistScrollTrack.active(now);if(playlistOpen&&playlistHwnd&&(scroll||playlistOpening)){paintPlaylist();if(playlistOpening&&playlistOpenProgress()>=1){playlistOpening=false;paintPlaylist();}if(!scroll&&!playlistOpening)KillTimer(hwnd,PlaylistAnimTimer);}else{KillTimer(hwnd,PlaylistAnimTimer);if(playlistOpen&&playlistHwnd)paintPlaylist();}}else if(wp==SecondaryAnimTimer){if(layoutPanel&&panelOpening&&panelOpenProgress()<1)update();else{panelOpening=false;KillTimer(hwnd,SecondaryAnimTimer);update();}}else if(wp==VinylConfirmTimer){vinylRequested=false;KillTimer(hwnd,VinylConfirmTimer);}else if(wp==PlaylistRefreshTimer){if(playlistOpen)command("playlist");else KillTimer(hwnd,PlaylistRefreshTimer);}return 0;
    case WM_MOUSEWHEEL:{
     if(through||dragProgress||resizing||layoutPanel||moduleDragging||lines.empty())return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/scale(),y=p.y/scale();
     if(x<textX||x>lyricRight()||y<viewportTop||y>viewportBottom)return 0;
@@ -1587,7 +1596,7 @@ class App {
    }
    case WM_MOUSEMOVE:{float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();
     if(modulePress&&!moduleDragging){float dx=x-pressX,dy=y-pressY;if(dx*dx+dy*dy>DragThreshold*DragThreshold){bool windowDrag=pressAction==3;clearModulePress();if(windowDrag){ReleaseCapture();SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0);}else update();return 0;}return 0;}
-    if(moduleDragging){dragX=x;dragY=y;dragTargetSlot=moduleAt(x,y);update();return 0;}
+    if(moduleDragging){dragX=x;dragY=y;int target=moduleAt(x,y);dragTargetSlot=target;if(target>=0)morphDragHighlight(target);update();return 0;}
     if(resizing){POINT point;GetCursorPos(&point);int w=int(clamp(resizeSize.cx+point.x-resizeStart.x,MinWindowWidth*scale(),MaxWindowWidth*scale())),h=int(clamp(resizeSize.cy+point.y-resizeStart.y,MinWindowHeight*scale(),MaxWindowHeight*scale()));if(w!=geometryPixels.cx||h!=geometryPixels.cy)SetWindowPos(hwnd,nullptr,0,0,w,h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);}else if(splitterDrag){if(splitterDrag==1)leftRatio=float(clamp((x-SlotMargin)/std::max(1.f,width-SlotMargin*2),.10,.60));else topHeight=float(clamp(y-SlotMargin-SlotGapY*.5f,18.f,std::max(18.f,height-SlotMargin-SlotBottom-SlotGapY-60.f)));applySlotLayout();rebuildMeta();layoutDirty=true;update();}else if(dragProgress){dragRatio=transport.ratio(x);update();}else if(!hover&&!through){hover=true;TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,hwnd,0};TrackMouseEvent(&event);update();}else if(hover&&!through&&slotLayout&&!layoutPanel){int split=splitterAt(x,y);if(split!=splitterHover){splitterHover=split;update();}}return 0;}
    case WM_MOUSELEAVE:if(!dragProgress&&!resizing&&!splitterDrag){hover=false;splitterHover=0;update();}return 0;
    case WM_LBUTTONDOWN:{if(through)return 0;float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();
