@@ -222,7 +222,7 @@ class App {
  std::vector<std::shared_ptr<LyricLayout>> lyricLayouts;
  size_t nextLayoutToWarm=0;
  static constexpr UINT_PTR LayoutWarmupTimer=5;
- static constexpr UINT_PTR PlaylistRefreshTimer=6,VinylConfirmTimer=7,PlaylistWatchTimer=1,PlaylistAnimTimer=8,SecondaryAnimTimer=9;
+ static constexpr UINT_PTR PlaylistRefreshTimer=6,VinylConfirmTimer=7,PlaylistWatchTimer=1,PlaylistAnimTimer=8,SecondaryAnimTimer=9,LongPressTimer=10;
  static constexpr double OpenAnimMs=170;
  static constexpr float PlaylistRowHeight=44,PlaylistHeaderHeight=46;
  struct PlaylistItem {std::wstring title,artist;std::string resourceId;double duration=0;int index=0;bool current=false;};
@@ -245,11 +245,16 @@ class App {
  // slotModule[slot] holds the module assigned to that slot.
  static constexpr int ModuleTitle=0,ModuleCover=1,ModuleLyrics=2;
  static constexpr float SlotMargin=12,SlotBottom=32,SlotGap=14,SlotGapY=8;
+ static constexpr float DragThreshold=6.f;static constexpr UINT LongPressMs=380;
  int slotModule[3]={ModuleCover,ModuleTitle,ModuleLyrics};
  float leftRatio=.28f,topHeight=20.f,titleFontSize=12.f;
  bool miniMode=false,slotLayout=false,layoutPanel=false;
  int splitterDrag=0,splitterHover=0;
  D2D1_RECT_F slotRects[3]{};
+ // Long-press module drag: a short press is replayed on release, a long press
+ // lifts the module and swaps it with the slot under the cursor on drop.
+ struct SlotSwap {int a=-1,b=-1;D2D1_RECT_F fromA{},toA{},fromB{},toB{};LineTrack p;};
+ bool modulePress=false,moduleDragging=false;int pressSlot=-1,pressAction=0,pressIcon=-1;double pressSeek=-1;float pressX=0,pressY=0,dragX=0,dragY=0;int dragTargetSlot=-1;SlotSwap slotSwap;
  float lyricsRight=348,lyricsCenterY=65;
  Layout metaVertical;
  bool seekPending=false;uint64_t seekSerial=0,seekRequest=0;double seekStarted=0,seekFallback=0;
@@ -269,6 +274,16 @@ class App {
  double indicatorNow()const{return indicatorMotion.now(animationWall());}
  void stopBrowsing(bool animateReturn=false){browseIndex=-1;wheelRemainder=0;browseUntil=0;returnFromBrowse=true;manualTransition=manualLayoutPending=animateReturn;KillTimer(hwnd,4);layoutDirty=true;}
  void finishTransition(){for(auto&item:groups){auto&g=item.second;g.y.snap(g.y.to);g.zoom.snap(g.zoom.to);g.mainAlpha.snap(g.mainAlpha.to);g.subAlpha.snap(g.subAlpha.to);}transitionActive=false;manualTransition=false;manualLayoutPending=false;}
+ // Slot index under a DIP point, or -1 when the point falls between slots.
+ int moduleAt(float x,float y)const{for(int i=0;i<3;i++){const auto&r=slotRects[i];if(x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom)return i;}return -1;}
+ static const wchar_t* moduleLabel(int module){return module==ModuleCover?L"封面":module==ModuleLyrics?L"歌词":L"标题";}
+ bool swapAnimating()const{return slotSwap.a>=0&&slotSwap.p.active(animationWall());}
+ // Drop any pending press/drag without replaying the click and without
+ // touching the mouse capture (used by WM_CAPTURECHANGED and resize paths).
+ void clearModulePress(){modulePress=moduleDragging=false;pressSlot=-1;pressAction=0;pressIcon=-1;pressSeek=-1;dragTargetSlot=-1;KillTimer(hwnd,LongPressTimer);}
+ static D2D1_RECT_F lerpRect(const D2D1_RECT_F&a,const D2D1_RECT_F&b,float p){return D2D1::RectF(mixf(a.left,b.left,p),mixf(a.top,b.top,p),mixf(a.right,b.right,p),mixf(a.bottom,b.bottom,p));}
+ static D2D1_RECT_F squareIn(const D2D1_RECT_F&r){float side=std::min(r.right-r.left,r.bottom-r.top),cx=(r.left+r.right)*.5f,cy=(r.top+r.bottom)*.5f;return D2D1::RectF(cx-side*.5f,cy-side*.5f,cx+side*.5f,cy+side*.5f);}
+ static D2D1_RECT_F animatedCoverRect(const D2D1_RECT_F&a,const D2D1_RECT_F&b,float p){return lerpRect(squareIn(a),squareIn(b),p);}
  float scale()const{return dpi/96.f;}
  int slotOfModule(int module)const{for(int i=0;i<3;i++)if(slotModule[i]==module)return i;return -1;}
  bool titleVertical()const{return slotLayout&&slotModule[0]==ModuleTitle;}
@@ -784,7 +799,7 @@ class App {
   width=std::max(1.f,float(rect.right)/scale());height=std::max(1.f,float(rect.bottom)/scale());
   miniMode=width<=400.f||height<=170.f;
   if(miniMode){
-   layoutPanel=false;panelOpening=false;KillTimer(hwnd,SecondaryAnimTimer);splitterDrag=0;splitterHover=0;slotLayout=false;
+   clearModulePress();slotSwap.a=slotSwap.b=-1;layoutPanel=false;panelOpening=false;KillTimer(hwnd,SecondaryAnimTimer);splitterDrag=0;splitterHover=0;slotLayout=false;
    auto art=coverGeometry(rect.right,rect.bottom,scale());artSize=art.side;artRadius=art.radius;
    artBounds=D2D1::RectF(art.left,art.top,art.left+art.side,art.top+art.side);textX=artBounds.right+16;transport=transportGeometry(width,height,textX,scale());
    viewportTop=32;viewportBottom=std::min(height-28,transport.y-14);
@@ -932,31 +947,43 @@ class App {
   for(const auto&item:groups)if(groupVisible(item.second,now))drawGroupAt(g,item.second,item.first,time,now);
  }
  void drawLyrics(Graphics&g,double time){drawLyricsAt(g,time,motionNow());}
+ void drawCoverArt(Graphics&g,const D2D1_RECT_F&rect,float radius,float alpha,ID2D1Geometry*clip){
+  auto*t=g.target;
+  if(!g.cover){g.brush->SetColor(D2D1::ColorF(.33f,.39f,.51f));t->FillRoundedRectangle(D2D1::RoundedRect(rect,radius,radius),g.brush.get());return;}
+  float side=float(std::min(cover.width,cover.height)),x=(cover.width-side)/2,y=(cover.height-side)/2;
+  if(g.coverBrush&&alpha>=.999f&&g.coverOpaque){
+   float w=std::max(1.f,rect.right-rect.left),scaleArt=w/std::max(1.f,side);
+   g.coverBrush->SetTransform(D2D1::Matrix3x2F::Translation(-x,-y)*D2D1::Matrix3x2F::Scale(scaleArt,scaleArt)*D2D1::Matrix3x2F::Translation(rect.left,rect.top));
+   t->FillRoundedRectangle(D2D1::RoundedRect(rect,radius,radius),g.coverBrush.get());
+  }else{
+   // One rounded mask for both layers avoids accumulated antialiasing halos.
+   t->PushLayer(D2D1::LayerParameters(rect,clip),nullptr);
+   g.brush->SetColor(D2D1::ColorF(.33f,.39f,.51f));t->FillRectangle(rect,g.brush.get());
+   t->DrawBitmap(g.cover.get(),rect,alpha,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,D2D1::RectF(x,y,x+side,y+side));
+   t->PopLayer();
+  }
+ }
  void draw(Graphics&g){
   auto*t=g.target;double time=current()+offset,now=motionNow();
 
   t->Clear(D2D1::ColorF(0,0));auto card=D2D1::RoundedRect(D2D1::RectF(.5f,.5f,width-.5f,height-.5f),17,17);drawBackground(g,card);g.brush->SetColor(D2D1::ColorF(.62f,.65f,.80f,.65f));t->DrawRoundedRectangle(card,g.brush.get(),1);
+  D2D1_MATRIX_3X2_F moduleBase;t->GetTransform(&moduleBase);
   float coverAlpha=(g.cover&&playing)?float(clamp((nowMs()-coverSince)/250,0,1)):1.f;
-  if(!g.cover){
-   g.brush->SetColor(D2D1::ColorF(.33f,.39f,.51f));
-   t->FillRoundedRectangle(D2D1::RoundedRect(artBounds,artRadius,artRadius),g.brush.get());
-  }else if(g.coverBrush&&coverAlpha>=.999f&&g.coverOpaque){
-   float side=float(std::min(cover.width,cover.height)),x=(cover.width-side)/2,y=(cover.height-side)/2;
-   float scaleArt=artSize/std::max(1.f,side);
-   g.coverBrush->SetTransform(D2D1::Matrix3x2F::Translation(-x,-y)*D2D1::Matrix3x2F::Scale(scaleArt,scaleArt)*D2D1::Matrix3x2F::Translation(artBounds.left,artBounds.top));
-   t->FillRoundedRectangle(D2D1::RoundedRect(artBounds,artRadius,artRadius),g.coverBrush.get());
-  }else{
-   // One rounded mask for both layers avoids accumulated antialiasing halos.
-   t->PushLayer(D2D1::LayerParameters(artBounds,coverClip.get()),nullptr);
-   g.brush->SetColor(D2D1::ColorF(.33f,.39f,.51f));t->FillRectangle(artBounds,g.brush.get());
-   float side=float(std::min(cover.width,cover.height)),x=(cover.width-side)/2,y=(cover.height-side)/2;
-   t->DrawBitmap(g.cover.get(),artBounds,coverAlpha,D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,D2D1::RectF(x,y,x+side,y+side));
-   t->PopLayer();
-  }
+  if(slotSwap.a>=0&&slotSwap.p.active(animationWall())&&(slotSwap.a==ModuleCover||slotSwap.b==ModuleCover)){
+   bool isA=slotSwap.a==ModuleCover;const auto&from=isA?slotSwap.fromA:slotSwap.fromB;const auto&to=isA?slotSwap.toA:slotSwap.toB;
+   float p=slotSwap.p.value(animationWall());
+   t->PushAxisAlignedClip(lerpRect(from,to,p),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+   drawCoverArt(g,animatedCoverRect(from,to,p),artRadius,coverAlpha,nullptr);
+   t->PopAxisAlignedClip();
+  }else drawCoverArt(g,artBounds,artRadius,coverAlpha,coverClip.get());
+  bool titleMoved=beginModuleDraw(g,ModuleTitle,moduleBase);
   drawTitle(g);
+  endModuleDraw(g,titleMoved,moduleBase);
+  bool lyricMoved=beginModuleDraw(g,ModuleLyrics,moduleBase);
   t->PushAxisAlignedClip(D2D1::RectF(textX,viewportTop,lyricRight(),viewportBottom),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
   drawLyricsAt(g,time,now);
   t->PopAxisAlignedClip();
+  endModuleDraw(g,lyricMoved,moduleBase);
   if(hover&&!through){
    float y=transport.y;g.brush->SetColor(D2D1::ColorF(.55f,.58f,.69f));t->DrawLine(D2D1::Point2F(transport.left,y),D2D1::Point2F(transport.right,y),g.brush.get(),3);
    float ratio=float(dragProgress?dragRatio:duration>0?clamp(current()/duration,0,1):0);g.brush->SetColor(D2D1::ColorF(.91f,.93f,.99f));t->DrawLine(D2D1::Point2F(transport.left,y),D2D1::Point2F(transport.left+transport.length()*ratio,y),g.brush.get(),3);t->FillEllipse(D2D1::Ellipse(D2D1::Point2F(transport.left+transport.length()*ratio,y),3,3),g.brush.get());
@@ -972,7 +999,38 @@ class App {
   }
   if(!through){g.brush->SetColor(D2D1::ColorF(1,1,1,hover?.5f:.2f));for(int line=1;line<=3;line++){float d=3.f+line*4.5f;t->DrawLine(D2D1::Point2F(width-d,height-3),D2D1::Point2F(width-3,height-d),g.brush.get(),1);}}
   drawSplitters(g);
+  drawDragOverlay(g);
   drawLayoutPanel(g);
+ }
+ // While a module swap animates, draw it translated from its previous slot and
+ // clipped to the moving rectangle, so the two modules glide into place.
+ bool beginModuleDraw(Graphics&g,int module,const D2D1_MATRIX_3X2_F&base){
+  auto*t=g.target;if(slotSwap.a<0||!slotSwap.p.active(animationWall()))return false;
+  bool isA=module==slotSwap.a,isB=module==slotSwap.b;if(!isA&&!isB)return false;
+  const auto&from=isA?slotSwap.fromA:slotSwap.fromB;const auto&to=isA?slotSwap.toA:slotSwap.toB;
+  float p=slotSwap.p.value(animationWall()),rest=1-p;
+  float dx=((from.left+from.right)-(to.left+to.right))*.5f*rest,dy=((from.top+from.bottom)-(to.top+to.bottom))*.5f*rest;
+  t->SetTransform(D2D1::Matrix3x2F::Translation(dx,dy)*base);
+  t->PushAxisAlignedClip(to,D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+  return true;
+ }
+ void endModuleDraw(Graphics&g,bool active,const D2D1_MATRIX_3X2_F&base){if(!active)return;g.target->PopAxisAlignedClip();g.target->SetTransform(base);}
+ void drawDragOverlay(Graphics&g){
+  if(!moduleDragging||pressSlot<0)return;auto*t=g.target;
+  const auto&src=slotRects[pressSlot];g.brush->SetColor(D2D1::ColorF(0,0,0,.28f));t->FillRoundedRectangle(D2D1::RoundedRect(src,12,12),g.brush.get());
+  if(dragTargetSlot>=0&&dragTargetSlot!=pressSlot){
+   const auto&dst=slotRects[dragTargetSlot];
+   g.brush->SetColor(D2D1::ColorF(1,1,1,.06f));t->FillRoundedRectangle(D2D1::RoundedRect(dst,12,12),g.brush.get());
+   g.brush->SetColor(D2D1::ColorF(1,1,1,.5f));t->DrawRoundedRectangle(D2D1::RoundedRect(dst,12,12),g.brush.get(),1.5f);
+   Layout hint=layout(moduleLabel(slotModule[pressSlot]),playlistMetaFormat.get());
+   text(g,hint,(dst.left+dst.right-hint.width)*.5f,(dst.top+dst.bottom-hint.height)*.5f,D2D1::ColorF(1,1,1),.45f);
+  }
+  Layout chip=layout(moduleLabel(slotModule[pressSlot]),playlistMetaFormat.get());
+  float w=chip.width+18,h=chip.height+10,x=float(clamp(dragX+12.f,8.f,width-w-8.f)),y=float(clamp(dragY-10.f,8.f,height-h-8.f));
+  g.brush->SetColor(D2D1::ColorF(0,0,0,.35f));t->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x,y+1.5f,x+w,y+h+1.5f),9,9),g.brush.get());
+  g.brush->SetColor(D2D1::ColorF(.14f,.15f,.20f,.94f));t->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x,y,x+w,y+h),9,9),g.brush.get());
+  g.brush->SetColor(D2D1::ColorF(1,1,1,.20f));t->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x,y,x+w,y+h),9,9),g.brush.get(),1);
+  text(g,chip,x+9,y+5,D2D1::ColorF(1,1,1),.95f);
  }
  void drawTitle(Graphics&g){
   auto*t=g.target;
@@ -1157,7 +1215,7 @@ class App {
  }
  void schedule(){
   if(!renderVisible){stopFrames();return;}
-  double time=current()+offset,next=200;bool active=manualTransition||(playing&&valid&&(transitionActive||lyricView()==LyricView::Prelude));
+  double time=current()+offset,next=200;bool swapping=swapAnimating();bool active=manualTransition||swapping||(playing&&valid&&(transitionActive||lyricView()==LyricView::Prelude));
   if(playing&&valid&&!untimed&&index+1<int(lines.size())){next=std::min(next,std::max(1.,lines[index+1].time-time));if(browseIndex<0&&stagger&&focusIndex<=index)next=std::min(next,std::max(1.,lines[index+1].time-time-200));}
   if(playing&&valid&&!untimed)for(const auto&item:groups){const auto&g=item.second;if(!groupVisible(g,motionNow()))continue;const auto&line=g.content->model;
    if(indicatorVisible(g))active=true;
@@ -1165,7 +1223,7 @@ class App {
    if(canScroll(item.first)&&((g.content->glyphs.empty()&&rowWidth(g)*g.zoom.value(motionNow())>lyricWidth())||(g.translated&&g.content->subtitle.width*g.zoom.value(motionNow())>lyricWidth()))){double begin=line.time+900,end=begin+std::max(1200.,(line.duration>0?line.duration:4000)-1600);if(time<begin)next=std::min(next,begin-time);else if(time<end)active=true;}
   }
   bool flying=!flight.rows.empty(),coverAnimating=coverSince>=0&&nowMs()-coverSince<250;active=active||coverAnimating||flying;
-  bool backgroundActive=backgroundAnimating();bool run=flying||manualTransition||(playing&&valid&&((!untimed&&!lines.empty())||hover||coverAnimating||backgroundActive));double wanted=active?1000./(fps==60?60:30):std::max(1.,next);if(backgroundActive)wanted=std::min(wanted,1000./background.fps);
+  bool backgroundActive=backgroundAnimating();bool run=flying||manualTransition||swapping||(playing&&valid&&((!untimed&&!lines.empty())||hover||coverAnimating||backgroundActive));double wanted=active?1000./(fps==60?60:30):std::max(1.,next);if(backgroundActive)wanted=std::min(wanted,1000./background.fps);
   if(!run){stopFrames();return;}
   if(frameTimer&&(!systemMoving||modalFrames.active())){
    bool same=frameRunning&&std::abs(framePeriod-wanted)<.001;if(same&&frameArmed)return;
@@ -1178,6 +1236,7 @@ class App {
  }
  void update(){
   if(valid)hasClock=true;
+  if(slotSwap.a>=0&&!slotSwap.p.active(animationWall()))slotSwap.a=slotSwap.b=-1;
   if(!renderVisible||(!valid&&!untimed))manualTransition=manualLayoutPending=false;
   // Browse animation can run while paused; the playback and background clocks stay separate.
   if(browseIndex>=0&&(lines.empty()||(!untimed&&animationWall()>=browseUntil))){
@@ -1402,7 +1461,12 @@ class App {
   else if(type=="exit")DestroyWindow(hwnd);
   else if(type=="capture")capture();
   else if(type=="test-wheel"&&!capturePath.empty()){POINT p{int(std::round(m["x"].n()*scale())),int(std::round(m["y"].n()*scale()))};ClientToScreen(hwnd,&p);message(WM_MOUSEWHEEL,MAKEWPARAM(0,SHORT(clamp(m["delta"].n(),-12000,12000))),MAKELPARAM(p.x,p.y));report("test-wheel-ack",true,true);}
-  else if(type=="test-click"&&!capturePath.empty()){int x=int(std::round(m["x"].n()*scale())),y=int(std::round(m["y"].n()*scale()));message(WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(x,y));report("test-click-ack",true,true);}
+  else if(type=="test-click"&&!capturePath.empty()){int x=int(std::round(m["x"].n()*scale())),y=int(std::round(m["y"].n()*scale()));message(WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(x,y));message(WM_LBUTTONUP,0,MAKELPARAM(x,y));report("test-click-ack",true,true);}
+  else if(type=="test-mouse"&&!capturePath.empty()){
+   int x=int(std::round(m["x"].n()*scale())),y=int(std::round(m["y"].n()*scale()));std::string event=m["event"].s();
+   UINT msg=event=="down"?WM_LBUTTONDOWN:event=="up"?WM_LBUTTONUP:WM_MOUSEMOVE;
+   message(msg,event=="up"?WPARAM(0):WPARAM(MK_LBUTTON),MAKELPARAM(x,y));report("test-mouse-ack",true,true);
+  }
   else if(type=="inspect"&&!capturePath.empty())report("inspection",true,true);
   else if(type=="test-settings"&&!capturePath.empty()){
    if(m["motionWall"].kind==Json::Number){testWall=true;testWallMs=m["motionWall"].n();}
@@ -1461,6 +1525,27 @@ class App {
   if(slotLayout)applySlotLayout();
   rebuildMeta();layoutDirty=true;save();update();
  }
+ void activateIcon(int icon){switch(icon){case 0:toggleLayoutPanel();break;case 1:command("like");break;case 2:requestVinylPage();break;case 3:togglePlaylist();break;case 4:setTop(!top);save();update();break;case 5:setThrough(true);update();break;default:DestroyWindow(hwnd);break;}}
+ // Row under the pointer inside the lyric viewport, used to replay a short press.
+ bool lyricRowAt(float x,float y,double&seek)const{
+  if(untimed||y<viewportTop||y>viewportBottom||x<textX||x>lyricRight())return false;
+  double now=motionNow();
+  for(const auto&item:groups){const auto&g=item.second;if(!groupVisible(g,now))continue;float top=g.y.value(now);if(y>=top-2&&y<=top+g.renderedHeight(g.zoom.value(now))){seek=std::max(0.,g.content->model.time-offset);return true;}}
+  return false;
+ }
+ void startSlotSwap(int fromSlot,int toSlot){
+  if(fromSlot<0||toSlot<0||fromSlot==toSlot)return;
+  int moduleA=slotModule[fromSlot],moduleB=slotModule[toSlot];
+  D2D1_RECT_F fromA=slotRects[fromSlot],fromB=slotRects[toSlot];
+  slotModule[toSlot]=moduleA;slotModule[fromSlot]=moduleB;
+  if(slotLayout)applySlotLayout();
+  rebuildMeta();layoutDirty=true;save();
+  slotSwap.a=moduleA;slotSwap.b=moduleB;
+  slotSwap.fromA=fromA;slotSwap.toA=slotRects[toSlot];
+  slotSwap.fromB=fromB;slotSwap.toB=slotRects[fromSlot];
+  slotSwap.p.snap(0);slotSwap.p.target(1,animationWall(),0,260,0);
+  update();
+ }
  void menu(POINT point){HMENU menu=CreatePopupMenu();AppendMenuW(menu,MF_STRING|(translation?MF_CHECKED:0),1,L"显示翻译");AppendMenuW(menu,MF_STRING|(top?MF_CHECKED:0),2,L"置顶");AppendMenuW(menu,MF_STRING|(through?MF_CHECKED:0),3,L"鼠标穿透（在插件设置中恢复）");AppendMenuW(menu,MF_STRING|(fps==30?MF_CHECKED:0),4,L"30 FPS");AppendMenuW(menu,MF_STRING|(fps==60?MF_CHECKED:0),5,L"60 FPS");AppendMenuW(menu,MF_STRING,6,L"关闭小窗");SetForegroundWindow(hwnd);int choice=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,point.x,point.y,0,hwnd,nullptr);DestroyMenu(menu);if(choice==1){translation=!translation;layoutDirty=true;}else if(choice==2)setTop(!top);else if(choice==3)setThrough(!through);else if(choice==4)fps=30;else if(choice==5)fps=60;else if(choice==6){DestroyWindow(hwnd);return;}save();update();}
  LRESULT message(UINT msg,WPARAM wp,LPARAM lp){
   switch(msg){
@@ -1474,9 +1559,9 @@ class App {
    case WM_WINDOWPOSCHANGED:{auto result=DefWindowProcW(hwnd,msg,wp,lp);setRenderVisible(IsWindowVisible(hwnd)&&!IsIconic(hwnd));if(playlistOpen)positionPlaylist();return result;}
    case WM_SIZE:if(wp==SIZE_MINIMIZED){closePlaylist();setRenderVisible(false);return 0;}if(wp!=SIZE_MAXHIDE&&wp!=SIZE_MAXSHOW&&factory&&textFactory&&hwnd&&geometry()){if(playlistOpen)closePlaylist();update();if(resizing&&renderVisible)UpdateWindow(hwnd);}return 0;
    case WM_DPICHANGED:{closePlaylist();dpi=float(HIWORD(wp));if(target)target->SetDpi(dpi);auto*rect=reinterpret_cast<RECT*>(lp);SetWindowPos(hwnd,nullptr,rect->left,rect->top,rect->right-rect->left,rect->bottom-rect->top,SWP_NOACTIVATE|SWP_NOZORDER|SWP_NOCOPYBITS);recordNormalBounds();if(resizing){GetCursorPos(&resizeStart);RECT current{};GetWindowRect(hwnd,&current);resizeSize={current.right-current.left,current.bottom-current.top};}if(geometry())update();if(renderVisible)UpdateWindow(hwnd);return 0;}
-   case WM_TIMER:if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();else if(wp==PlaylistAnimTimer){double now=animationWall();bool scroll=playlistOpen&&playlistHwnd&&playlistScrollTrack.active(now);if(playlistOpen&&playlistHwnd&&(scroll||playlistOpening)){paintPlaylist();if(playlistOpening&&playlistOpenProgress()>=1){playlistOpening=false;paintPlaylist();}if(!scroll&&!playlistOpening)KillTimer(hwnd,PlaylistAnimTimer);}else{KillTimer(hwnd,PlaylistAnimTimer);if(playlistOpen&&playlistHwnd)paintPlaylist();}}else if(wp==SecondaryAnimTimer){if(layoutPanel&&panelOpening&&panelOpenProgress()<1)update();else{panelOpening=false;KillTimer(hwnd,SecondaryAnimTimer);update();}}else if(wp==VinylConfirmTimer){vinylRequested=false;KillTimer(hwnd,VinylConfirmTimer);}else if(wp==PlaylistRefreshTimer){if(playlistOpen)command("playlist");else KillTimer(hwnd,PlaylistRefreshTimer);}return 0;
+   case WM_TIMER:if(wp==LongPressTimer){KillTimer(hwnd,LongPressTimer);if(modulePress&&!moduleDragging&&slotLayout&&!miniMode&&!layoutPanel){moduleDragging=true;pressAction=0;dragX=pressX;dragY=pressY;dragTargetSlot=pressSlot;update();}return 0;}if(wp==1||wp==4){update();if(systemMoving&&renderVisible)UpdateWindow(hwnd);}else if(wp==3){cancelSeek();position=seekFallback+(playing&&valid?nowMs()-seekStarted:0);anchor=nowMs();error="seek-timeout";update();}else if(wp==2&&!demo){if(ownerProcess.exited())DestroyWindow(hwnd);else if(!bridge||!bridge->connected()||nowMs()-received>45000)freezeConnection();}else if(wp==LayoutWarmupTimer)warmLyricLayouts();else if(wp==PlaylistAnimTimer){double now=animationWall();bool scroll=playlistOpen&&playlistHwnd&&playlistScrollTrack.active(now);if(playlistOpen&&playlistHwnd&&(scroll||playlistOpening)){paintPlaylist();if(playlistOpening&&playlistOpenProgress()>=1){playlistOpening=false;paintPlaylist();}if(!scroll&&!playlistOpening)KillTimer(hwnd,PlaylistAnimTimer);}else{KillTimer(hwnd,PlaylistAnimTimer);if(playlistOpen&&playlistHwnd)paintPlaylist();}}else if(wp==SecondaryAnimTimer){if(layoutPanel&&panelOpening&&panelOpenProgress()<1)update();else{panelOpening=false;KillTimer(hwnd,SecondaryAnimTimer);update();}}else if(wp==VinylConfirmTimer){vinylRequested=false;KillTimer(hwnd,VinylConfirmTimer);}else if(wp==PlaylistRefreshTimer){if(playlistOpen)command("playlist");else KillTimer(hwnd,PlaylistRefreshTimer);}return 0;
    case WM_MOUSEWHEEL:{
-    if(through||dragProgress||resizing||layoutPanel||lines.empty())return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/scale(),y=p.y/scale();
+    if(through||dragProgress||resizing||layoutPanel||moduleDragging||lines.empty())return 0;POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&p);float x=p.x/scale(),y=p.y/scale();
     if(x<textX||x>lyricRight()||y<viewportTop||y>viewportBottom)return 0;
     wheelRemainder+=GET_WHEEL_DELTA_WPARAM(wp);int steps=wheelRemainder/WHEEL_DELTA;wheelRemainder%=WHEEL_DELTA;if(!steps)return 0;
     int origin=browseIndex>=0?browseIndex:(untimed&&focusIndex>=0?focusIndex:index);
@@ -1484,6 +1569,7 @@ class App {
    }
    case WM_SETCURSOR:{
     if(LOWORD(lp)==HTCLIENT&&!through){
+     if(moduleDragging){SetCursor(LoadCursorW(nullptr,IDC_SIZEALL));return TRUE;}
      POINT pt{};GetCursorPos(&pt);ScreenToClient(hwnd,&pt);float x=pt.x/scale(),y=pt.y/scale();LPCWSTR id=IDC_ARROW;
      int split=splitterAt(x,y);
      if(layoutPanel){int slot=0,module=0,fi=0,delta=0;id=(panelChipAt(x,y,slot,module)||panelCloseAt(x,y)||panelFontAt(x,y,fi,delta))?IDC_HAND:IDC_ARROW;}
@@ -1499,13 +1585,26 @@ class App {
     }
     break;
    }
-   case WM_MOUSEMOVE:{float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();if(resizing){POINT point;GetCursorPos(&point);int w=int(clamp(resizeSize.cx+point.x-resizeStart.x,MinWindowWidth*scale(),MaxWindowWidth*scale())),h=int(clamp(resizeSize.cy+point.y-resizeStart.y,MinWindowHeight*scale(),MaxWindowHeight*scale()));if(w!=geometryPixels.cx||h!=geometryPixels.cy)SetWindowPos(hwnd,nullptr,0,0,w,h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);}else if(splitterDrag){if(splitterDrag==1)leftRatio=float(clamp((x-SlotMargin)/std::max(1.f,width-SlotMargin*2),.10,.60));else topHeight=float(clamp(y-SlotMargin-SlotGapY*.5f,18.f,std::max(18.f,height-SlotMargin-SlotBottom-SlotGapY-60.f)));applySlotLayout();rebuildMeta();layoutDirty=true;update();}else if(dragProgress){dragRatio=transport.ratio(x);update();}else if(!hover&&!through){hover=true;TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,hwnd,0};TrackMouseEvent(&event);update();}else if(hover&&!through&&slotLayout&&!layoutPanel){int split=splitterAt(x,y);if(split!=splitterHover){splitterHover=split;update();}}return 0;}
+   case WM_MOUSEMOVE:{float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();
+    if(modulePress&&!moduleDragging){float dx=x-pressX,dy=y-pressY;if(dx*dx+dy*dy>DragThreshold*DragThreshold){bool windowDrag=pressAction==3;clearModulePress();if(windowDrag){ReleaseCapture();SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0);}else update();return 0;}return 0;}
+    if(moduleDragging){dragX=x;dragY=y;dragTargetSlot=moduleAt(x,y);update();return 0;}
+    if(resizing){POINT point;GetCursorPos(&point);int w=int(clamp(resizeSize.cx+point.x-resizeStart.x,MinWindowWidth*scale(),MaxWindowWidth*scale())),h=int(clamp(resizeSize.cy+point.y-resizeStart.y,MinWindowHeight*scale(),MaxWindowHeight*scale()));if(w!=geometryPixels.cx||h!=geometryPixels.cy)SetWindowPos(hwnd,nullptr,0,0,w,h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);}else if(splitterDrag){if(splitterDrag==1)leftRatio=float(clamp((x-SlotMargin)/std::max(1.f,width-SlotMargin*2),.10,.60));else topHeight=float(clamp(y-SlotMargin-SlotGapY*.5f,18.f,std::max(18.f,height-SlotMargin-SlotBottom-SlotGapY-60.f)));applySlotLayout();rebuildMeta();layoutDirty=true;update();}else if(dragProgress){dragRatio=transport.ratio(x);update();}else if(!hover&&!through){hover=true;TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,hwnd,0};TrackMouseEvent(&event);update();}else if(hover&&!through&&slotLayout&&!layoutPanel){int split=splitterAt(x,y);if(split!=splitterHover){splitterHover=split;update();}}return 0;}
    case WM_MOUSELEAVE:if(!dragProgress&&!resizing&&!splitterDrag){hover=false;splitterHover=0;update();}return 0;
    case WM_LBUTTONDOWN:{if(through)return 0;float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();
     if(layoutPanel){int slot=0,module=0,fi=0,delta=0;if(panelCloseAt(x,y)){layoutPanel=false;update();return 0;}if(panelChipAt(x,y,slot,module)){assignSlot(slot,module);return 0;}if(panelFontAt(x,y,fi,delta)){if(fi==0)setTitleFontSize(titleFontSize+delta);else setLyricFontSize(currentFontSize+delta);return 0;}if(!panelInside(x,y)){layoutPanel=false;update();}return 0;}
     int split=splitterAt(x,y);if(split){splitterDrag=split;splitterHover=split;SetCapture(hwnd);update();return 0;}
     int icon=iconAt(x,y);bool iconZone=icon>=0;if(playlistOpen&&!iconZone&&!(x>width-17&&y>height-17))closePlaylist();if(x>width-17&&y>height-17){resizing=true;GetCursorPos(&resizeStart);RECT r;GetWindowRect(hwnd,&r);resizeSize={r.right-r.left,r.bottom-r.top};SetCapture(hwnd);update();return 0;}
-    if(iconZone){switch(icon){case 0:toggleLayoutPanel();break;case 1:command("like");break;case 2:requestVinylPage();break;case 3:togglePlaylist();break;case 4:setTop(!top);save();update();break;case 5:setThrough(true);update();break;default:DestroyWindow(hwnd);break;}return 0;}
+    // Slot surfaces defer their click to the release so a long press can lift
+    // the module instead of firing a seek/icon/window-drag action.
+    if(slotLayout&&!miniMode&&!layoutPanel&&!swapAnimating()){
+     int slot=moduleAt(x,y);
+     if(slot>=0){
+      modulePress=true;pressSlot=slot;pressX=x;pressY=y;pressIcon=iconZone?icon:-1;pressAction=iconZone?1:3;pressSeek=-1;
+      if(!iconZone){double seek;if(lyricRowAt(x,y,seek)){pressAction=2;pressSeek=seek;}}
+      SetCapture(hwnd);SetTimer(hwnd,LongPressTimer,LongPressMs,nullptr);update();return 0;
+     }
+    }
+    if(iconZone){activateIcon(icon);return 0;}
     if(hover&&y>=transport.y-14){
      switch(transport.hit(x,y)){
       case ControlHit::Seek:if(duration>0){dragProgress=true;dragRatio=transport.ratio(x);SetCapture(hwnd);update();}break;
@@ -1514,15 +1613,20 @@ class App {
     }
     if(!untimed&&y>=viewportTop&&y<=viewportBottom&&x>=textX&&x<=lyricRight()){for(const auto&item:groups){if(!groupVisible(item.second,motionNow()))continue;float top=item.second.y.value(motionNow());if(y>=top-2&&y<=top+item.second.renderedHeight(item.second.zoom.value(motionNow()))){requestSeek(std::max(0.,item.second.content->model.time-offset));update();return 0;}}}
     ReleaseCapture();SendMessageW(hwnd,WM_NCLBUTTONDOWN,HTCAPTION,0);return 0;}
-   case WM_LBUTTONUP:if(splitterDrag){splitterDrag=0;splitterHover=0;ReleaseCapture();save();update();return 0;}if(dragProgress){requestSeek(duration*dragRatio);dragProgress=false;ReleaseCapture();update();}if(resizing)ReleaseCapture();return 0;
-   case WM_LBUTTONDBLCLK:{float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();if((x>=artBounds.left&&x<=artBounds.right&&y>=artBounds.top&&y<=artBounds.bottom)||x<textX)command("play");return 0;}
-   case WM_CAPTURECHANGED:{bool sized=resizing,split=splitterDrag!=0;splitterDrag=0;dragProgress=false;resizing=false;POINT p;GetCursorPos(&p);ScreenToClient(hwnd,&p);hover=!through&&p.x>=0&&p.y>=0&&p.x<width*scale()&&p.y<height*scale();update();if(sized||split)save();return 0;}
+   case WM_LBUTTONUP:if(moduleDragging||modulePress){
+    float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();bool dragging=moduleDragging;int from=pressSlot,action=pressAction,icon=pressIcon;double seek=pressSeek;int target=dragging?moduleAt(x,y):-1;
+    clearModulePress();ReleaseCapture();
+    if(dragging){if(target>=0&&target!=from)startSlotSwap(from,target);else update();}
+    else{if(action==1&&icon>=0)activateIcon(icon);else if(action==2&&seek>=0)requestSeek(seek);update();}
+    return 0;}if(splitterDrag){splitterDrag=0;splitterHover=0;ReleaseCapture();save();update();return 0;}if(dragProgress){requestSeek(duration*dragRatio);dragProgress=false;ReleaseCapture();update();}if(resizing)ReleaseCapture();return 0;
+   case WM_LBUTTONDBLCLK:{if(modulePress){clearModulePress();ReleaseCapture();}float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();if((x>=artBounds.left&&x<=artBounds.right&&y>=artBounds.top&&y<=artBounds.bottom)||x<textX)command("play");return 0;}
+   case WM_CAPTURECHANGED:{clearModulePress();bool sized=resizing,split=splitterDrag!=0;splitterDrag=0;dragProgress=false;resizing=false;POINT p;GetCursorPos(&p);ScreenToClient(hwnd,&p);hover=!through&&p.x>=0&&p.y>=0&&p.x<width*scale()&&p.y<height*scale();update();if(sized||split)save();return 0;}
    case WM_KEYDOWN:if(wp==VK_ESCAPE&&layoutPanel){layoutPanel=false;update();return 0;}break;
    case WM_CONTEXTMENU:{POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};if(p.x==-1)GetCursorPos(&p);menu(p);return 0;}
    case WM_ENTERSIZEMOVE:stopFrames();if(frameTimer)WaitForSingleObject(frameTimer,0);systemMoving=true;modalFrames.start(hwnd,frameTimer,FrameReady);update();return 0;
    case WM_EXITSIZEMOVE:systemMoving=false;stopFrames();modalFrames.stop();recordNormalBounds();update();save();return 0;
    case WM_CLOSE:DestroyWindow(hwnd);return 0;
-   case WM_DESTROY:try{if(bridge)bridge->finish();}catch(...){}closing=true;closePlaylist();systemMoving=false;stopFrames();modalFrames.stop();save();KillTimer(hwnd,1);KillTimer(hwnd,2);KillTimer(hwnd,3);KillTimer(hwnd,4);KillTimer(hwnd,LayoutWarmupTimer);KillTimer(hwnd,PlaylistRefreshTimer);KillTimer(hwnd,PlaylistAnimTimer);KillTimer(hwnd,SecondaryAnimTimer);KillTimer(hwnd,VinylConfirmTimer);stopCoverWorker();PostQuitMessage(0);return 0;
+   case WM_DESTROY:try{if(bridge)bridge->finish();}catch(...){}closing=true;closePlaylist();systemMoving=false;stopFrames();modalFrames.stop();save();KillTimer(hwnd,1);KillTimer(hwnd,2);KillTimer(hwnd,3);KillTimer(hwnd,4);KillTimer(hwnd,LayoutWarmupTimer);KillTimer(hwnd,PlaylistRefreshTimer);KillTimer(hwnd,PlaylistAnimTimer);KillTimer(hwnd,SecondaryAnimTimer);KillTimer(hwnd,VinylConfirmTimer);KillTimer(hwnd,LongPressTimer);stopCoverWorker();PostQuitMessage(0);return 0;
   }return DefWindowProcW(hwnd,msg,wp,lp);
  }
  static LRESULT CALLBACK procedure(HWND window,UINT msg,WPARAM wp,LPARAM lp){App*app=reinterpret_cast<App*>(GetWindowLongPtrW(window,GWLP_USERDATA));if(msg==WM_NCCREATE){app=static_cast<App*>(reinterpret_cast<CREATESTRUCTW*>(lp)->lpCreateParams);app->hwnd=window;SetWindowLongPtrW(window,GWLP_USERDATA,reinterpret_cast<LONG_PTR>(app));}if(app){try{return app->message(msg,wp,lp);}catch(...){app->error="window-message-failed";}}return DefWindowProcW(window,msg,wp,lp);}
