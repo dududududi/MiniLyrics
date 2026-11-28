@@ -260,6 +260,10 @@ class App {
  bool modulePress=false,moduleDragging=false;int pressSlot=-1,pressAction=0,pressIcon=-1;double pressSeek=-1;float pressX=0,pressY=0,dragX=0,dragY=0;int dragTargetSlot=-1;SlotSwap slotSwap;DragHighlight dragHighlight;int dragHighlightSlot=-1;
  float lyricsRight=348,lyricsCenterY=65;
  Layout metaVertical,metaWide;
+ // Per-module alignment inside its slot (0 left, 1 center, 2 right), the
+ // title's flow direction (0 auto, 1 horizontal, 2 vertical) and the active
+ // settings-panel tab (0 layout, 1 alignment).
+ int alignCover=1,alignTitle=0,alignLyrics=0,titleOrientation=0,panelTab=0;
  bool seekPending=false;uint64_t seekSerial=0,seekRequest=0;double seekStarted=0,seekFallback=0;
  std::wstring settingsPath,capturePath,title=L"MiniLyrics",artist,coverUrl;std::string songId,error;
  double position=0,anchor=0,duration=0,offset=0,received=0,revision=0,rowSince=-1000,coverSince=-1000;
@@ -296,9 +300,27 @@ class App {
  static D2D1_RECT_F animatedCoverRect(const D2D1_RECT_F&a,const D2D1_RECT_F&b,float p){return lerpRect(squareIn(a),squareIn(b),p);}
  float scale()const{return dpi/96.f;}
  int slotOfModule(int module)const{for(int i=0;i<3;i++)if(slotModule[i]==module)return i;return -1;}
- bool titleVertical()const{return slotLayout&&slotModule[0]==ModuleTitle;}
+ static float alignFactor(int align){return align==1?.5f:align==2?1.f:0.f;}
+ float alignmentOffset(float available,float content,int align)const{return std::max(0.f,available-content)*alignFactor(align);}
+ // The automatic direction keeps the historical behaviour: a title in the
+ // narrow left column flows vertically, anywhere else horizontally.
+ bool titleVerticalActive()const{int slot=slotLayout?slotOfModule(ModuleTitle):-1;return slot>=0&&(titleOrientation==2||(titleOrientation==0&&slot==0));}
+ // Width a horizontal title may use. The compact variant reserves room for the
+ // hover icons, the wide one is used while the icons are hidden.
+ float titleAvailable(bool wide)const{
+  if(!slotLayout)return std::max(20.f,width-textX-(wide?24.f:157.f));
+  int slot=slotOfModule(ModuleTitle);if(slot<0)return std::max(20.f,width-textX);
+  const auto&r=slotRects[slot];float base=std::max(20.f,r.right-r.left);
+  return slot==0?base:std::max(20.f,base-(wide?24.f:182.f));
+ }
  float lyricRight()const{return slotLayout?lyricsRight:width-12;}
  float lyricWidth()const{return std::max(1.f,lyricRight()-textX);}
+ // Horizontal shift that places fitting content at the configured lyric edge.
+ // Overflowing rows keep the sung-position scroll and get no shift.
+ float lyricAlignShift(float content,float zoom=1.f)const{
+  float available=lyricWidth(),scaled=content*zoom;
+  return scaled<available?(available-scaled)/zoom*alignFactor(alignLyrics):0.f;
+ }
  float verticalIconStep(const D2D1_RECT_F&r)const{return std::max(12.f,std::min(24.f,(r.bottom-r.top)*.55f/7));}
  int iconCount()const{return slotLayout?7:6;}
  int iconActionOf(int index)const{return slotLayout?index:index+1;}
@@ -367,8 +389,7 @@ class App {
  void rebuildMeta(){
   std::wstring text=title+(artist.empty()?L"":L"  ·  "+artist);
   metaLayout=Layout();metaWide=Layout();metaVertical=Layout();
-  int titleSlot=slotLayout?slotOfModule(ModuleTitle):-1;
-  if(slotLayout&&titleSlot==0){
+  if(titleVerticalActive()){
    metaLayout=layout(text,metaFormat.get(),32.f);trimLayout(metaLayout);
    if(!text.empty()){
     // Vertical flow starts at the right edge of the layout box, so the box must
@@ -383,9 +404,8 @@ class App {
   }
   // Two widths: the compact one reserves room for the hover icons, while the
   // idle one lets a long title use the free space once the icons hide.
-  float base=slotLayout?slotRects[titleSlot].right-slotRects[titleSlot].left:width-textX;
-  metaLayout=layout(text,metaFormat.get(),std::max(20.f,base-(slotLayout?182.f:157.f)));trimLayout(metaLayout);
-  metaWide=layout(text,metaFormat.get(),std::max(20.f,base-24.f));trimLayout(metaWide);
+  metaLayout=layout(text,metaFormat.get(),titleAvailable(false));trimLayout(metaLayout);
+  metaWide=layout(text,metaFormat.get(),titleAvailable(true));trimLayout(metaWide);
  }
  Layout fitted(const std::wstring&text,IDWriteTextFormat*format,float maxWidth){Layout l=layout(text,format,std::max(12.f,maxWidth));if(l.value){DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};Com<IDWriteInlineObject>sign;if(SUCCEEDED(textFactory->CreateEllipsisTrimmingSign(format,sign.put())))l.value->SetTrimming(&trim,sign.get());}return l;}
  int playlistVisibleRows()const{return std::max(1,int((playlistHeight-PlaylistHeaderHeight-6)/PlaylistRowHeight));}
@@ -858,8 +878,11 @@ class App {
   int top=(H-side)/2;
   const int slotTop=int(std::lround(coverSlot.top*s)),slotBottom=int(std::lround(coverSlot.bottom*s));
   top=std::max(slotTop,std::min(top,slotBottom-side));
-  const int centerX=int(std::lround((coverSlot.left+coverSlot.right)*.5f*s));
-  const int left=std::max(int(std::lround(coverSlot.left*s)),std::min(centerX-side/2,int(std::lround(coverSlot.right*s))-side));
+  const int slotLeft=int(std::lround(coverSlot.left*s)),slotRight=int(std::lround(coverSlot.right*s));
+  int left=slotLeft;
+  if(alignCover==1)left=slotLeft+(slotRight-slotLeft-side)/2;
+  else if(alignCover==2)left=slotRight-side;
+  left=std::max(slotLeft,std::min(left,slotRight-side));
   artBounds=D2D1::RectF(left/s,top/s,(left+side)/s,(top+side)/s);artSize=float(side)/s;
   artRadius=float(std::max(1,std::min(side/2,int(std::lround(10*s)))))/s;
   check(factory->CreateRoundedRectangleGeometry(D2D1::RoundedRect(artBounds,artRadius,artRadius),coverClip.put()));
@@ -907,13 +930,16 @@ class App {
  void drawGroupAt(Graphics&g,const LyricGroup&r,int id,double time,double now){
   if(r.opacity<=0)return;float zoom=std::max(.01f,r.zoom.value(now)),y=r.y.value(now);
   float available=lyricWidth(),phase=horizontalPhase(r,time,id,now);
+  // Alignment only applies while the row fits inside the viewport; overflowing
+  // rows keep the sung-position scroll, so the two offsets never stack.
+  float shift=lyricAlignShift(rowWidth(r),zoom);
   D2D1_MATRIX_3X2_F transform;bool scaled=zoom!=1.f;float originX=textX,originY=y;
   if(scaled){g.target->GetTransform(&transform);g.target->SetTransform(D2D1::Matrix3x2F::Scale(zoom,zoom)*D2D1::Matrix3x2F::Translation(textX,y)*transform);originX=originY=0;}
-  float x=originX-std::max(0.f,rowWidth(r)*zoom-available)*phase/zoom;
+  float x=originX-std::max(0.f,rowWidth(r)*zoom-available)*phase/zoom+shift;
   bool resetting=!r.active&&!r.resetWords.empty()&&now-r.resetAt<200;
   if(r.content->glyphs.empty()||staticPreview())text(g,r.content->main,x,originY,D2D1::ColorF(D2D1::ColorF::White),(staticPreview()?(id==focusIndex?1.f:.4f):r.mainAlpha.value(now))*r.opacity);
   else{
-   float clipLeft=originX-2.f,clipRight=originX+available/zoom+2.f;
+   float clipLeft=originX+shift-2.f,clipRight=originX+shift+available/zoom+2.f;
    for(size_t i=0;i<r.content->glyphs.size();i++){
     const auto&w=r.content->glyphs[i];float wx=x+w.x;
     if(wx+w.layout.width<clipLeft||wx>clipRight)continue;
@@ -928,9 +954,13 @@ class App {
    // anchor while scrolling; fade their dots instead of hiding them abruptly.
    float fade=1.f;
    if(browseIndex>=0){auto bounds=browseBounds();if(id<bounds.first||id>bounds.second)fade=float(clamp(browseDotsFade.value(animationWall()),0.,1.));}
-   if(fade>.001f)drawInterludeAt(g,r.dots,originX,originY,time,r.content->model.time,interludeDuration(r.content->model,id),indicatorNow(),fade*r.mainAlpha.value(now)*r.opacity);
+   if(fade>.001f)drawInterludeAt(g,r.dots,originX+lyricAlignShift(currentFontSize*3.1f,zoom),originY,time,r.content->model.time,interludeDuration(r.content->model,id),indicatorNow(),fade*r.mainAlpha.value(now)*r.opacity);
   }
-  if(r.translated){float subX=originX-std::max(0.f,r.content->subtitle.width*zoom-available)*timedHorizontalPhase(r,time,id)/zoom;text(g,r.content->subtitle,subX,originY+r.subtitleOffset(1.f),D2D1::ColorF(D2D1::ColorF::White),(staticPreview()?(id==focusIndex?.8f:.4f):r.subAlpha.value(now))*r.opacity);}
+  if(r.translated){
+   float subWidth=r.content->subtitle.width*zoom;
+   float subX=originX-std::max(0.f,subWidth-available)*timedHorizontalPhase(r,time,id)/zoom+lyricAlignShift(r.content->subtitle.width,zoom);
+   text(g,r.content->subtitle,subX,originY+r.subtitleOffset(1.f),D2D1::ColorF(D2D1::ColorF::White),(staticPreview()?(id==focusIndex?.8f:.4f):r.subAlpha.value(now))*r.opacity);
+  }
   if(scaled)g.target->SetTransform(transform);
  }
  void drawGroup(Graphics&g,const LyricGroup&r,int id,double time){drawGroupAt(g,r,id,time,motionNow());}
@@ -957,11 +987,11 @@ class App {
  }
  void drawLyricsAt(Graphics&g,double time,double now){
   float y=lyricAnchor();double dotsNow=indicatorNow();float dotsFade=float(clamp(browseDotsFade.value(animationWall()),0.,1.));
-  if(!flight.rows.empty()){if(dotsFade>.001f&&flight.prelude&&preludeDots.visible(dotsNow))drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,dotsNow,dotsFade);}
+  if(!flight.rows.empty()){if(dotsFade>.001f&&flight.prelude&&preludeDots.visible(dotsNow))drawInterludeAt(g,preludeDots,textX+lyricAlignShift(currentFontSize*3.1f),y,time,0,lines.front().time,dotsNow,dotsFade);}
   else switch(lyricView()){
-   case LyricView::Waiting:text(g,placeholder,textX,y,D2D1::ColorF(D2D1::ColorF::White));return;
+   case LyricView::Waiting:text(g,placeholder,textX+lyricAlignShift(placeholder.width),y,D2D1::ColorF(D2D1::ColorF::White));return;
    case LyricView::StaticPreview:break;
-   case LyricView::Prelude:if(dotsFade>.001f)drawInterludeAt(g,preludeDots,textX,y,time,0,lines.front().time,dotsNow,dotsFade);break;
+   case LyricView::Prelude:if(dotsFade>.001f)drawInterludeAt(g,preludeDots,textX+lyricAlignShift(currentFontSize*3.1f),y,time,0,lines.front().time,dotsNow,dotsFade);break;
    case LyricView::Rows:break;
   }
   for(const auto&item:groups)if(groupVisible(item.second,now))drawGroupAt(g,item.second,item.first,time,now);
@@ -1052,19 +1082,36 @@ class App {
   text(g,chip,x+9,y+5,D2D1::ColorF(1,1,1),.95f);
  }
  void drawTitle(Graphics&g){
-  auto*t=g.target;
-  if(!slotLayout){const Layout&m=(!hover||through)&&metaWide.value?metaWide:metaLayout;text(g,m,textX,12,D2D1::ColorF(.87f,.89f,.94f));}
-  else{
+  auto*t=g.target;D2D1_COLOR_F color=D2D1::ColorF(.87f,.89f,.94f);
+  if(!slotLayout){
+   bool wide=(!hover||through)&&metaWide.value;const Layout&m=wide?metaWide:metaLayout;
+   text(g,m,textX+alignmentOffset(titleAvailable(wide),m.width,alignTitle),12,color);
+  }else{
    int slot=slotOfModule(ModuleTitle);const auto&r=slotRects[slot];
-   if(slot==0){
-    float iconsTop=r.bottom-8-verticalIconStep(r)*7;
+   // The left column keeps its vertical icon stack, so a title there must stay
+   // above it; other slots reserve the icon strip horizontally instead.
+   float iconsTop=slot==0?r.bottom-8-verticalIconStep(r)*7:r.bottom;
+   if(titleVerticalActive()){
     if(metaVertical.value){
-     float x=r.left+(r.right-r.left-metaVertical.width)*.5f;
-     t->PushAxisAlignedClip(D2D1::RectF(r.left+1,r.top+2,r.right-1,std::max(r.top+2.f,iconsTop-4)),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-     text(g,metaVertical,x,r.top+4,D2D1::ColorF(.87f,.89f,.94f));
+     float x=r.left+1+alignmentOffset(r.right-r.left-2,metaVertical.width,alignTitle);
+     float bottom=std::max(r.top+2.f,iconsTop-4);
+     if(bottom>r.top+2.f){
+      t->PushAxisAlignedClip(D2D1::RectF(r.left+1,r.top+2,r.right-1,bottom),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+      text(g,metaVertical,x,r.top+4,color);
+      t->PopAxisAlignedClip();
+     }
+    }
+   }else{
+    bool wide=(!hover||through)&&metaWide.value;const Layout&m=wide?metaWide:metaLayout;
+    float x=r.left+alignmentOffset(titleAvailable(wide),m.width,alignTitle);
+    float y=slot==0?r.top+4:r.top+(r.bottom-r.top-m.height)*.5f;
+    float bottom=std::max(r.top+2.f,(slot==0?iconsTop:r.bottom)-2);
+    if(bottom>r.top+2.f){
+     t->PushAxisAlignedClip(D2D1::RectF(r.left+1,r.top+1,r.right-1,bottom),D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+     text(g,m,x,y,color);
      t->PopAxisAlignedClip();
     }
-   }else{const Layout&m=(!hover||through)&&metaWide.value?metaWide:metaLayout;text(g,m,r.left,r.top+(r.bottom-r.top-m.height)*.5f,D2D1::ColorF(.87f,.89f,.94f));}
+   }
   }
   if(hover&&!through)drawIcons(g);
  }
@@ -1147,22 +1194,41 @@ class App {
   if(std::abs(y-(slotRects[1].bottom+SlotGapY*.5f))<=3&&x>=slotRects[1].left&&x<=slotRects[1].right)return 2;
   return 0;
  }
- struct LayoutPanelGeometry {D2D1_RECT_F card,close,chips[3][3],fontMinus[2],fontPlus[2];};
+ struct LayoutPanelGeometry {D2D1_RECT_F card,close,tab[2],chips[3][3],fontMinus[2],fontPlus[2],align[4][3];};
  LayoutPanelGeometry panelGeometry()const{
   LayoutPanelGeometry p{};
   float w=std::min(width-20.f,380.f),h=std::min(height-12.f,154.f);
   float x=(width-w)*.5f,y=(height-h)*.5f;
   p.card=D2D1::RectF(x,y,x+w,y+h);p.close=D2D1::RectF(x+w-26,y+7,x+w-8,y+25);
-  float rowH=std::min(38.f,(h-40.f)/3.f),left=x+12.f,labelW=42.f,gap=6.f;
+  // Two tabs replace the former heading: layout (slots/fonts) and alignment.
+  p.tab[0]=D2D1::RectF(x+10,y+6,x+58,y+28);p.tab[1]=D2D1::RectF(x+62,y+6,x+110,y+28);
+  float contentTop=y+42.f;
+  float rowH=std::min(36.f,(h-46.f)/3.f),left=x+12.f,labelW=42.f,gap=6.f;
   float colRight=x+w-12.f,leftW=(colRight-142.f-8.f)-left;
   float chipW=std::min(66.f,(leftW-labelW-2*gap)/3.f);
-  for(int s=0;s<3;s++)for(int c=0;c<3;c++){float cx=left+labelW+c*(chipW+gap),cy=y+32.f+s*rowH;p.chips[s][c]=D2D1::RectF(cx,cy,cx+chipW,cy+rowH-8.f);}
+  for(int s=0;s<3;s++)for(int c=0;c<3;c++){float cx=left+labelW+c*(chipW+gap),cy=contentTop+s*rowH;p.chips[s][c]=D2D1::RectF(cx,cy,cx+chipW,cy+rowH-8.f);}
   for(int i=0;i<2;i++){
-   float cy=y+32.f+i*rowH+(rowH-8.f)*.5f,bh=std::min(22.f,std::max(16.f,rowH-10.f));
+   float cy=contentTop+i*rowH+(rowH-8.f)*.5f,bh=std::min(22.f,std::max(16.f,rowH-10.f));
    p.fontPlus[i]=D2D1::RectF(colRight-20,cy-bh*.5f,colRight,cy+bh*.5f);
    p.fontMinus[i]=D2D1::RectF(colRight-66,cy-bh*.5f,colRight-46,cy+bh*.5f);
   }
+  // Alignment tab: two columns of two label+triplet rows. Item order is
+  // 0 title direction, 1 cover, 2 title, 3 lyrics.
+  float alignH=std::min(44.f,(h-46.f)/2.f),aLabelW=54.f,aGap=4.f;
+  float colW=(w-24.f)*.5f,aChipW=std::min(42.f,(colW-aLabelW-2*aGap)/3.f);
+  for(int c=0;c<2;c++){
+   float colX=x+12.f+c*colW;
+   for(int r=0;r<2;r++){
+    int item=c*2+r;float cy=contentTop+r*alignH;
+    for(int i=0;i<3;i++){float cx=colX+aLabelW+i*(aChipW+aGap);p.align[item][i]=D2D1::RectF(cx,cy,cx+aChipW,cy+alignH-8.f);}
+   }
+  }
   return p;
+ }
+ bool panelTabAt(float x,float y,int&tab)const{
+  auto p=panelGeometry();
+  for(int i=0;i<2;i++){const auto&r=p.tab[i];if(x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom){tab=i;return true;}}
+  return false;
  }
  bool panelChipAt(float x,float y,int&slot,int&module)const{
   auto p=panelGeometry();
@@ -1176,6 +1242,12 @@ class App {
    if(x>=m.left&&x<=m.right&&y>=m.top&&y<=m.bottom){index=i;delta=-1;return true;}
    if(x>=pl.left&&x<=pl.right&&y>=pl.top&&y<=pl.bottom){index=i;delta=1;return true;}
   }
+  return false;
+ }
+ // item: 0 title direction, 1 cover, 2 title, 3 lyrics.
+ bool panelAlignAt(float x,float y,int&item,int&index)const{
+  auto p=panelGeometry();
+  for(int r=0;r<4;r++)for(int i=0;i<3;i++){const auto&box=p.align[r][i];if(x>=box.left&&x<=box.right&&y>=box.top&&y<=box.bottom){item=r;index=i;return true;}}
   return false;
  }
  bool panelCloseAt(float x,float y)const{auto p=panelGeometry();return x>=p.close.left&&x<=p.close.right&&y>=p.close.top&&y<=p.close.bottom;}
@@ -1192,37 +1264,65 @@ class App {
   float ins=4.5f;g.brush->SetColor(D2D1::ColorF(1,1,1,.58f));
   t->DrawLine(D2D1::Point2F(p.close.left+ins,p.close.top+ins),D2D1::Point2F(p.close.right-ins,p.close.bottom-ins),g.brush.get(),2);
   t->DrawLine(D2D1::Point2F(p.close.right-ins,p.close.top+ins),D2D1::Point2F(p.close.left+ins,p.close.bottom-ins),g.brush.get(),2);
-  auto heading=layout(L"布局设置",format);
-  text(g,heading,p.card.left+12,p.card.top+9,D2D1::ColorF(.95f,.96f,.99f));
-  g.brush->SetColor(D2D1::ColorF(1,1,1,.08f));
-  float div=p.fontMinus[0].left-54.f;
-  t->DrawLine(D2D1::Point2F(div,p.card.top+30),D2D1::Point2F(div,p.card.bottom-10),g.brush.get(),1);
-  for(int s=0;s<3;s++){
-   Layout label=layout(s==0?L"左槽":s==1?L"右上":L"右下",format);
-   text(g,label,p.card.left+12,p.chips[s][0].top+(p.chips[s][0].bottom-p.chips[s][0].top-label.height)*.5f,D2D1::ColorF(.72f,.75f,.84f),.9f);
-   for(int c=0;c<3;c++){
-    int module=c==0?ModuleCover:c==1?ModuleLyrics:ModuleTitle;const auto&r=p.chips[s][c];bool active=slotModule[s]==module;
-    g.brush->SetColor(D2D1::ColorF(1,1,1,active?.20f:.06f));t->FillRoundedRectangle(D2D1::RoundedRect(r,8,8),g.brush.get());
-    if(active){g.brush->SetColor(D2D1::ColorF(1,1,1,.55f));t->DrawRoundedRectangle(D2D1::RoundedRect(r,8,8),g.brush.get(),1);}
-    Layout chip=layout(module==ModuleCover?L"封面":module==ModuleLyrics?L"歌词":L"标题",format);
-    text(g,chip,r.left+(r.right-r.left-chip.width)*.5f,r.top+(r.bottom-r.top-chip.height)*.5f,active?D2D1::ColorF(1,1,1):D2D1::ColorF(.80f,.83f,.90f),active?1.f:.85f);
-   }
-  }
+  // Tabs replace the former plain heading: layout (slots/fonts) and alignment.
+  const wchar_t* tabs[2]={L"布局",L"对齐"};
   for(int i=0;i<2;i++){
-   const auto&m=p.fontMinus[i],&pl=p.fontPlus[i];
-   Layout label=layout(i==0?L"标题字号":L"歌词字号",format);
-   text(g,label,m.left-8-label.width,(m.top+m.bottom-label.height)*.5f,D2D1::ColorF(.72f,.75f,.84f),.9f);
-   for(int b=0;b<2;b++){
-    const auto&r=b==0?m:pl;g.brush->SetColor(D2D1::ColorF(1,1,1,.08f));t->FillRoundedRectangle(D2D1::RoundedRect(r,6,6),g.brush.get());
-    g.brush->SetColor(D2D1::ColorF(1,1,1,.20f));t->DrawRoundedRectangle(D2D1::RoundedRect(r,6,6),g.brush.get(),1);
-    float cx=(r.left+r.right)*.5f,cy=(r.top+r.bottom)*.5f;
-    g.brush->SetColor(D2D1::ColorF(1,1,1,.88f));t->DrawLine(D2D1::Point2F(cx-4,cy),D2D1::Point2F(cx+4,cy),g.brush.get(),1.6f);
-    if(b==1)t->DrawLine(D2D1::Point2F(cx,cy-4),D2D1::Point2F(cx,cy+4),g.brush.get(),1.6f);
+   const auto&r=p.tab[i];bool active=panelTab==i;
+   if(active){g.brush->SetColor(D2D1::ColorF(1,1,1,.16f));t->FillRoundedRectangle(D2D1::RoundedRect(r,7,7),g.brush.get());}
+   Layout tabLabel=layout(tabs[i],format);
+   text(g,tabLabel,r.left+(r.right-r.left-tabLabel.width)*.5f,r.top+(r.bottom-r.top-tabLabel.height)*.5f,active?D2D1::ColorF(1,1,1):D2D1::ColorF(.72f,.75f,.84f),active?1.f:.85f);
+  }
+  g.brush->SetColor(D2D1::ColorF(1,1,1,.08f));
+  t->DrawLine(D2D1::Point2F(p.card.left+10,p.card.top+34),D2D1::Point2F(p.card.right-10,p.card.top+34),g.brush.get(),1);
+  auto drawChip=[&](const D2D1_RECT_F&r,const wchar_t*label,bool active,float radius){
+   g.brush->SetColor(D2D1::ColorF(1,1,1,active?.20f:.06f));t->FillRoundedRectangle(D2D1::RoundedRect(r,radius,radius),g.brush.get());
+   if(active){g.brush->SetColor(D2D1::ColorF(1,1,1,.55f));t->DrawRoundedRectangle(D2D1::RoundedRect(r,radius,radius),g.brush.get(),1);}
+   Layout chip=layout(label,format);
+   text(g,chip,r.left+(r.right-r.left-chip.width)*.5f,r.top+(r.bottom-r.top-chip.height)*.5f,active?D2D1::ColorF(1,1,1):D2D1::ColorF(.80f,.83f,.90f),active?1.f:.85f);
+  };
+  if(panelTab==0){
+   g.brush->SetColor(D2D1::ColorF(1,1,1,.08f));
+   float div=p.fontMinus[0].left-54.f;
+   t->DrawLine(D2D1::Point2F(div,p.card.top+40),D2D1::Point2F(div,p.card.bottom-10),g.brush.get(),1);
+   for(int s=0;s<3;s++){
+    Layout label=layout(s==0?L"左槽":s==1?L"右上":L"右下",format);
+    text(g,label,p.card.left+12,p.chips[s][0].top+(p.chips[s][0].bottom-p.chips[s][0].top-label.height)*.5f,D2D1::ColorF(.72f,.75f,.84f),.9f);
+    for(int c=0;c<3;c++){
+     int module=c==0?ModuleCover:c==1?ModuleLyrics:ModuleTitle;
+     drawChip(p.chips[s][c],module==ModuleCover?L"封面":module==ModuleLyrics?L"歌词":L"标题",slotModule[s]==module,8);
+    }
    }
-   std::wstring value=std::to_wstring(int(std::lround(i==0?titleFontSize:currentFontSize)));
-   Layout valueLayout=layout(value,format);
-   float center=(m.right+pl.left)*.5f;
-   text(g,valueLayout,center-valueLayout.width*.5f,(m.top+m.bottom-valueLayout.height)*.5f,D2D1::ColorF(.90f,.92f,.97f));
+   for(int i=0;i<2;i++){
+    const auto&m=p.fontMinus[i],&pl=p.fontPlus[i];
+    Layout label=layout(i==0?L"标题字号":L"歌词字号",format);
+    text(g,label,m.left-8-label.width,(m.top+m.bottom-label.height)*.5f,D2D1::ColorF(.72f,.75f,.84f),.9f);
+    for(int b=0;b<2;b++){
+     const auto&r=b==0?m:pl;g.brush->SetColor(D2D1::ColorF(1,1,1,.08f));t->FillRoundedRectangle(D2D1::RoundedRect(r,6,6),g.brush.get());
+     g.brush->SetColor(D2D1::ColorF(1,1,1,.20f));t->DrawRoundedRectangle(D2D1::RoundedRect(r,6,6),g.brush.get(),1);
+     float cx=(r.left+r.right)*.5f,cy=(r.top+r.bottom)*.5f;
+     g.brush->SetColor(D2D1::ColorF(1,1,1,.88f));t->DrawLine(D2D1::Point2F(cx-4,cy),D2D1::Point2F(cx+4,cy),g.brush.get(),1.6f);
+     if(b==1)t->DrawLine(D2D1::Point2F(cx,cy-4),D2D1::Point2F(cx,cy+4),g.brush.get(),1.6f);
+    }
+    std::wstring value=std::to_wstring(int(std::lround(i==0?titleFontSize:currentFontSize)));
+    Layout valueLayout=layout(value,format);
+    float center=(m.right+pl.left)*.5f;
+    text(g,valueLayout,center-valueLayout.width*.5f,(m.top+m.bottom-valueLayout.height)*.5f,D2D1::ColorF(.90f,.92f,.97f));
+   }
+  }else{
+   g.brush->SetColor(D2D1::ColorF(1,1,1,.08f));
+   float div=(p.card.left+p.card.right)*.5f-4.f;
+   t->DrawLine(D2D1::Point2F(div,p.card.top+40),D2D1::Point2F(div,p.card.bottom-10),g.brush.get(),1);
+   const wchar_t* labels[4]={L"标题方向",L"封面对齐",L"标题对齐",L"歌词对齐"};
+   for(int item=0;item<4;item++){
+    const auto&first=p.align[item][0];
+    Layout label=layout(labels[item],format);
+    text(g,label,first.left-6-label.width,first.top+(first.bottom-first.top-label.height)*.5f,D2D1::ColorF(.72f,.75f,.84f),.9f);
+    int value=item==0?titleOrientation:item==1?alignCover:item==2?alignTitle:alignLyrics;
+    for(int i=0;i<3;i++){
+     const wchar_t*name=item==0?(i==0?L"自动":i==1?L"横排":L"竖排"):(i==0?L"左":i==1?L"中":L"右");
+     drawChip(p.align[item][i],name,value==i,7);
+    }
+   }
   }
   t->SetTransform(savedTransform);
  }
@@ -1524,7 +1624,10 @@ class App {
  Json layoutState()const{
   Json j=Json::obj();Json slots;slots.kind=Json::Array;
   for(int i=0;i<3;i++)slots.array.push_back(Json(slotModule[i]));
-  j["Slots"]=slots;j["Left"]=double(leftRatio);j["Top"]=double(topHeight);return j;
+  j["Slots"]=slots;j["Left"]=double(leftRatio);j["Top"]=double(topHeight);
+  Json align;align.kind=Json::Array;
+  align.array.push_back(Json(alignCover));align.array.push_back(Json(alignTitle));align.array.push_back(Json(alignLyrics));
+  j["Align"]=align;j["TitleOrientation"]=titleOrientation;return j;
  }
  void readLayout(const Json&j){
   if(j.kind!=Json::Object)return;
@@ -1536,6 +1639,11 @@ class App {
   }
   if(j["Left"].kind==Json::Number)leftRatio=float(clamp(j["Left"].n(),0.12,0.6));
   if(j["Top"].kind==Json::Number)topHeight=float(clamp(j["Top"].n(),18,400));
+  const auto&a=j["Align"];
+  if(a.kind==Json::Array&&a.array.size()==3){
+   alignCover=int(clamp(a.array[0].n(1),0,2));alignTitle=int(clamp(a.array[1].n(0),0,2));alignLyrics=int(clamp(a.array[2].n(0),0,2));
+  }
+  if(j["TitleOrientation"].kind==Json::Number)titleOrientation=int(clamp(j["TitleOrientation"].n(),0,2));
  }
  void toggleLayoutPanel(){if(miniMode)return;layoutPanel=!layoutPanel;splitterHover=0;if(layoutPanel){closePlaylist();panelOpenAt=nowMs();panelOpening=true;SetTimer(hwnd,SecondaryAnimTimer,8,nullptr);}else{panelOpening=false;KillTimer(hwnd,SecondaryAnimTimer);}update();}
  void assignSlot(int slot,int module){
@@ -1543,6 +1651,18 @@ class App {
   int displaced=slotModule[slot];slotModule[slot]=slotModule[from];slotModule[from]=displaced;
   if(slotLayout)applySlotLayout();
   rebuildMeta();layoutDirty=true;save();update();
+ }
+ void setTitleOrientation(int value){
+  if(titleOrientation==value)return;titleOrientation=value;
+  if(slotLayout)applySlotLayout();
+  rebuildMeta();layoutDirty=true;save();update();
+ }
+ // item: 0 title direction (handled above), 1 cover, 2 title, 3 lyrics.
+ void setAlignment(int item,int value){
+  int&target=item==1?alignCover:item==2?alignTitle:alignLyrics;
+  if(target==value)return;target=value;
+  if(item==1&&slotLayout)applySlotLayout();
+  layoutDirty=true;save();update();
  }
  void activateIcon(int icon){switch(icon){case 0:toggleLayoutPanel();break;case 1:command("like");break;case 2:requestVinylPage();break;case 3:togglePlaylist();break;case 4:setTop(!top);save();update();break;case 5:setThrough(true);update();break;default:DestroyWindow(hwnd);break;}}
  // Row under the pointer inside the lyric viewport, used to replay a short press.
@@ -1591,7 +1711,10 @@ class App {
      if(moduleDragging){SetCursor(LoadCursorW(nullptr,IDC_SIZEALL));return TRUE;}
      POINT pt{};GetCursorPos(&pt);ScreenToClient(hwnd,&pt);float x=pt.x/scale(),y=pt.y/scale();LPCWSTR id=IDC_ARROW;
      int split=splitterAt(x,y);
-     if(layoutPanel){int slot=0,module=0,fi=0,delta=0;id=(panelChipAt(x,y,slot,module)||panelCloseAt(x,y)||panelFontAt(x,y,fi,delta))?IDC_HAND:IDC_ARROW;}
+     if(layoutPanel){
+      int slot=0,module=0,fi=0,delta=0,tab=-1,item=0,index=0;
+      id=(panelTabAt(x,y,tab)||panelCloseAt(x,y)||(panelTab==0?(panelChipAt(x,y,slot,module)||panelFontAt(x,y,fi,delta)):panelAlignAt(x,y,item,index)))?IDC_HAND:IDC_ARROW;
+     }
      else if(split==1)id=IDC_SIZEWE;
      else if(split==2)id=IDC_SIZENS;
      else if(x>width-17&&y>height-17)id=IDC_SIZENWSE;
@@ -1610,7 +1733,20 @@ class App {
     if(resizing){POINT point;GetCursorPos(&point);int w=int(clamp(resizeSize.cx+point.x-resizeStart.x,MinWindowWidth*scale(),MaxWindowWidth*scale())),h=int(clamp(resizeSize.cy+point.y-resizeStart.y,MinWindowHeight*scale(),MaxWindowHeight*scale()));if(w!=geometryPixels.cx||h!=geometryPixels.cy)SetWindowPos(hwnd,nullptr,0,0,w,h,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOCOPYBITS);}else if(splitterDrag){if(splitterDrag==1)leftRatio=float(clamp((x-SlotMargin)/std::max(1.f,width-SlotMargin*2),.10,.60));else topHeight=float(clamp(y-SlotMargin-SlotGapY*.5f,18.f,std::max(18.f,height-SlotMargin-SlotBottom-SlotGapY-60.f)));applySlotLayout();rebuildMeta();layoutDirty=true;update();}else if(dragProgress){dragRatio=transport.ratio(x);update();}else if(!hover&&!through){hover=true;TRACKMOUSEEVENT event{sizeof(event),TME_LEAVE,hwnd,0};TrackMouseEvent(&event);update();}else if(hover&&!through&&slotLayout&&!layoutPanel){int split=splitterAt(x,y);if(split!=splitterHover){splitterHover=split;update();}}return 0;}
    case WM_MOUSELEAVE:if(!dragProgress&&!resizing&&!splitterDrag){hover=false;splitterHover=0;update();}return 0;
    case WM_LBUTTONDOWN:{if(through)return 0;float x=GET_X_LPARAM(lp)/scale(),y=GET_Y_LPARAM(lp)/scale();
-    if(layoutPanel){int slot=0,module=0,fi=0,delta=0;if(panelCloseAt(x,y)){layoutPanel=false;update();return 0;}if(panelChipAt(x,y,slot,module)){assignSlot(slot,module);return 0;}if(panelFontAt(x,y,fi,delta)){if(fi==0)setTitleFontSize(titleFontSize+delta);else setLyricFontSize(currentFontSize+delta);return 0;}if(!panelInside(x,y)){layoutPanel=false;update();}return 0;}
+    if(layoutPanel){
+     int slot=0,module=0,fi=0,delta=0,tab=-1,item=0,index=0;
+     if(panelCloseAt(x,y)){layoutPanel=false;update();return 0;}
+     if(panelTabAt(x,y,tab)){panelTab=tab;update();return 0;}
+     if(panelTab==0){
+      if(panelChipAt(x,y,slot,module)){assignSlot(slot,module);return 0;}
+      if(panelFontAt(x,y,fi,delta)){if(fi==0)setTitleFontSize(titleFontSize+delta);else setLyricFontSize(currentFontSize+delta);return 0;}
+     }else if(panelAlignAt(x,y,item,index)){
+      if(item==0)setTitleOrientation(index);else setAlignment(item,index);
+      return 0;
+     }
+     if(!panelInside(x,y)){layoutPanel=false;update();}
+     return 0;
+    }
     int split=splitterAt(x,y);if(split){splitterDrag=split;splitterHover=split;SetCapture(hwnd);update();return 0;}
     int icon=iconAt(x,y);bool iconZone=icon>=0;if(playlistOpen&&!iconZone&&!(x>width-17&&y>height-17))closePlaylist();if(x>width-17&&y>height-17){resizing=true;GetCursorPos(&resizeStart);RECT r;GetWindowRect(hwnd,&r);resizeSize={r.right-r.left,r.bottom-r.top};SetCapture(hwnd);update();return 0;}
     // Slot surfaces defer their click to the release so a long press can lift
