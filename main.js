@@ -79,7 +79,36 @@ const MINILYRICS_VERSION="0.8.3";
       current:()=>output,snapshot:()=>({reportedPlaying:reported,playing:output,inferredFromProgress:inferred,
         progressSamples:run?.steps??0})};
   }
-  const api={finite, wellFormed, normalizeLines, metadata, createPlaybackState};
+  // Minimal LRC reader used only as a fallback when RNP exposes no lyrics
+  // (e.g. NetEase sitting in its tray/mini player). Metadata tags are ignored.
+  function parseLrc(text){
+    const out=[],seen=new Set(),head=/^\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/;
+    for(const raw of String(text??'').split(/\r?\n/)){
+      let rest=raw,times=[],m;
+      while((m=head.exec(rest))){
+        times.push(((+m[1])*60+(+m[2]))*1000+(m[3]?Number((m[3]+'000').slice(0,3)):0));
+        rest=rest.slice(m[0].length);
+      }
+      const body=rest.trim();
+      if(!times.length||!body)continue;
+      for(const time of times){
+        const key=time+'|'+body;
+        if(seen.has(key))continue;
+        seen.add(key);out.push({time,text:body});
+      }
+    }
+    return out.sort((a,b)=>a.time-b.time);
+  }
+  // Merge the original and translated LRC by their timestamps.
+  function mergeLyrics(text,translatedText){
+    const translated=new Map();
+    for(const line of parseLrc(translatedText)){
+      const key=Math.round(line.time/10);
+      if(!translated.get(key))translated.set(key,line.text);
+    }
+    return parseLrc(text).map(line=>({time:line.time,text:line.text,translation:translated.get(Math.round(line.time/10))||''}));
+  }
+  const api={finite, wellFormed, normalizeLines, metadata, createPlaybackState, parseLrc, mergeLyrics};
   if(typeof module!=='undefined') module.exports=api; else root.MiniLyricsCore=api;
 })(typeof window!=='undefined'?window:globalThis);
 
@@ -475,6 +504,7 @@ const MINILYRICS_VERSION="0.8.3";
   let windowSession=null,reconnectTimer=null;
   let player=null,detachPlayer=null,song={id:'',ncmId:'',duration:0},lines=[];
   let position=0,anchor=performance.now(),playing=false,clockValid=false,offset=0;
+  let remoteLyrics={songId:'',at:-Infinity,pending:false};
   let sourcePosition=null,sourcePlaying=null,sourceKind=null,sourceAdvancedAt=0,hostState=null;
   let lastMeta='',lastLyrics='',lyricMode='waiting',lyricRevision=0,lastRnp=null,lastAppliedRnp=null;
   let pendingSeek=null,seekTimer=null,lastSeekId=0;
@@ -552,6 +582,33 @@ const MINILYRICS_VERSION="0.8.3";
     if(update&&Array.isArray(update.lyrics)&&aliases().has(providerId(update))){setLyrics(update,true);return;}
     if(aliases().has(providerId(snapshot))){setLyrics(snapshot);return;}
     for(const [id,d]of [...rnpCache].reverse())if(aliases().has(id)){setLyrics(d);return;}
+  }
+  // Fallback source: RNP only publishes lyrics while its page is mounted, so a
+  // tray/mini NetEase window can stay silent. Fetch the song's LRC directly.
+  async function fetchRemoteLyrics(ncmId){
+    const url='https://music.163.com/api/song/lyric?id='+encodeURIComponent(ncmId)+'&lv=-1&kv=-1&tv=-1&rv=-1';
+    let response=null;
+    try{if(typeof window.betterncm?.fetch==='function')response=await window.betterncm.fetch(url);}catch{}
+    if(!response)try{response=await fetch(url,{credentials:'include'});}catch{}
+    if(!response||!response.ok)return null;
+    let data=null;try{data=await response.json();}catch{return null;}
+    const list=C.mergeLyrics(data?.lrc?.lyric??'',data?.tlyric?.lyric??'');
+    return list.length?list:null;
+  }
+  function maybeFetchLyrics(){
+    if(!player||!song.id||!song.ncmId||lyricMode!=='waiting'||remoteLyrics.pending)return;
+    const id=String(song.ncmId),now=performance.now();
+    if(remoteLyrics.songId===id&&now-remoteLyrics.at<60000)return;
+    remoteLyrics={songId:id,at:now,pending:true};
+    fetchRemoteLyrics(id).then(list=>{
+      if(stopped||!list||String(song.ncmId)!==id||lyricMode!=='waiting')return;
+      const normalized=C.normalizeLines(list);
+      if(!normalized.length)return;
+      const signature=JSON.stringify({mode:'timed',lines:normalized});
+      if(signature===lastLyrics)return;
+      lines=normalized;lyricMode='timed';lastLyrics=signature;
+      send({type:'lyrics',songId:song.id,revision:++lyricRevision,mode:lyricMode,lines});refreshStatus();
+    }).catch(e=>console.debug('[MiniLyrics] 直连歌词获取失败',e)).finally(()=>{remoteLyrics.pending=false;});
   }
   function sendRnpStyle(force=false){
     const classes=document.body?.classList,names=['smooth','sharp','lazy','easeout'];let curve=0;
@@ -692,7 +749,7 @@ const MINILYRICS_VERSION="0.8.3";
   function tick(){
     if(stopped||socket?.readyState!==1)return;
     try{
-      attachPlayer();sample();sendRnpStyle();
+      attachPlayer();sample();sendRnpStyle();maybeFetchLyrics();
       if(playing&&clockValid&&!pendingSeek&&!playerTimelineFresh()){
         position=live();anchor=performance.now();clockValid=false;status='等待 网易云播放器 播放进度';sendClock();
       }

@@ -259,7 +259,7 @@ class App {
  struct DragHighlight {D2D1_RECT_F from{},to{};LineTrack p;bool visible=false;};
  bool modulePress=false,moduleDragging=false;int pressSlot=-1,pressAction=0,pressIcon=-1;double pressSeek=-1;float pressX=0,pressY=0,dragX=0,dragY=0;int dragTargetSlot=-1;SlotSwap slotSwap;DragHighlight dragHighlight;int dragHighlightSlot=-1;
  float lyricsRight=348,lyricsCenterY=65;
- Layout metaVertical;
+ Layout metaVertical,metaWide;
  bool seekPending=false;uint64_t seekSerial=0,seekRequest=0;double seekStarted=0,seekFallback=0;
  std::wstring settingsPath,capturePath,title=L"MiniLyrics",artist,coverUrl;std::string songId,error;
  double position=0,anchor=0,duration=0,offset=0,received=0,revision=0,rowSince=-1000,coverSince=-1000;
@@ -360,22 +360,32 @@ class App {
   makeFormat(metaFormat,size,DWRITE_FONT_WEIGHT_NORMAL);
   titleFontSize=size;rebuildMeta();save();update();
  }
+ void trimLayout(Layout&l){
+  if(!l.value)return;DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};Com<IDWriteInlineObject>sign;
+  if(SUCCEEDED(textFactory->CreateEllipsisTrimmingSign(metaFormat.get(),sign.put())))l.value->SetTrimming(&trim,sign.get());
+ }
  void rebuildMeta(){
-  float maxWidth=std::max(20.f,width-textX-157);
-  if(slotLayout){int slot=slotOfModule(ModuleTitle);maxWidth=slot==0?32.f:std::max(20.f,slotRects[slot].right-slotRects[slot].left-182.f);}
-  metaLayout=layout(title+(artist.empty()?L"":L"  ·  "+artist),metaFormat.get(),maxWidth);
-  if(metaLayout.value){DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};Com<IDWriteInlineObject>sign;if(SUCCEEDED(textFactory->CreateEllipsisTrimmingSign(metaFormat.get(),sign.put())))metaLayout.value->SetTrimming(&trim,sign.get());}
-  metaVertical=Layout();
   std::wstring text=title+(artist.empty()?L"":L"  ·  "+artist);
-  if(slotLayout&&slotModule[0]==ModuleTitle&&!text.empty()){
-   // Vertical flow starts at the right edge of the layout box, so the box must
-   // be exactly one line wide; a wide box would push glyphs outside the slot.
-   float lineHeight=std::max(16.f,metaLayout.height);
-   check(textFactory->CreateTextLayout(text.c_str(),UINT32(text.size()),metaFormat.get(),lineHeight,50000,metaVertical.value.put()));
-   metaVertical.value->SetReadingDirection(DWRITE_READING_DIRECTION_TOP_TO_BOTTOM);
-   metaVertical.value->SetFlowDirection(DWRITE_FLOW_DIRECTION_RIGHT_TO_LEFT);
-   DWRITE_TEXT_METRICS metrics{};check(metaVertical.value->GetMetrics(&metrics));metaVertical.width=metrics.width;metaVertical.height=metrics.height;
+  metaLayout=Layout();metaWide=Layout();metaVertical=Layout();
+  int titleSlot=slotLayout?slotOfModule(ModuleTitle):-1;
+  if(slotLayout&&titleSlot==0){
+   metaLayout=layout(text,metaFormat.get(),32.f);trimLayout(metaLayout);
+   if(!text.empty()){
+    // Vertical flow starts at the right edge of the layout box, so the box must
+    // be exactly one line wide; a wide box would push glyphs outside the slot.
+    float lineHeight=std::max(16.f,metaLayout.height);
+    check(textFactory->CreateTextLayout(text.c_str(),UINT32(text.size()),metaFormat.get(),lineHeight,50000,metaVertical.value.put()));
+    metaVertical.value->SetReadingDirection(DWRITE_READING_DIRECTION_TOP_TO_BOTTOM);
+    metaVertical.value->SetFlowDirection(DWRITE_FLOW_DIRECTION_RIGHT_TO_LEFT);
+    DWRITE_TEXT_METRICS metrics{};check(metaVertical.value->GetMetrics(&metrics));metaVertical.width=metrics.width;metaVertical.height=metrics.height;
+   }
+   return;
   }
+  // Two widths: the compact one reserves room for the hover icons, while the
+  // idle one lets a long title use the free space once the icons hide.
+  float base=slotLayout?slotRects[titleSlot].right-slotRects[titleSlot].left:width-textX;
+  metaLayout=layout(text,metaFormat.get(),std::max(20.f,base-(slotLayout?182.f:157.f)));trimLayout(metaLayout);
+  metaWide=layout(text,metaFormat.get(),std::max(20.f,base-24.f));trimLayout(metaWide);
  }
  Layout fitted(const std::wstring&text,IDWriteTextFormat*format,float maxWidth){Layout l=layout(text,format,std::max(12.f,maxWidth));if(l.value){DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER,0,0};Com<IDWriteInlineObject>sign;if(SUCCEEDED(textFactory->CreateEllipsisTrimmingSign(format,sign.put())))l.value->SetTrimming(&trim,sign.get());}return l;}
  int playlistVisibleRows()const{return std::max(1,int((playlistHeight-PlaylistHeaderHeight-6)/PlaylistRowHeight));}
@@ -1043,7 +1053,7 @@ class App {
  }
  void drawTitle(Graphics&g){
   auto*t=g.target;
-  if(!slotLayout){text(g,metaLayout,textX,12,D2D1::ColorF(.87f,.89f,.94f));}
+  if(!slotLayout){const Layout&m=(!hover||through)&&metaWide.value?metaWide:metaLayout;text(g,m,textX,12,D2D1::ColorF(.87f,.89f,.94f));}
   else{
    int slot=slotOfModule(ModuleTitle);const auto&r=slotRects[slot];
    if(slot==0){
@@ -1054,7 +1064,7 @@ class App {
      text(g,metaVertical,x,r.top+4,D2D1::ColorF(.87f,.89f,.94f));
      t->PopAxisAlignedClip();
     }
-   }else text(g,metaLayout,r.left,r.top+(r.bottom-r.top-metaLayout.height)*.5f,D2D1::ColorF(.87f,.89f,.94f));
+   }else{const Layout&m=(!hover||through)&&metaWide.value?metaWide:metaLayout;text(g,m,r.left,r.top+(r.bottom-r.top-m.height)*.5f,D2D1::ColorF(.87f,.89f,.94f));}
   }
   if(hover&&!through)drawIcons(g);
  }

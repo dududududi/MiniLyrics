@@ -9,6 +9,7 @@
   let windowSession=null,reconnectTimer=null;
   let player=null,detachPlayer=null,song={id:'',ncmId:'',duration:0},lines=[];
   let position=0,anchor=performance.now(),playing=false,clockValid=false,offset=0;
+  let remoteLyrics={songId:'',at:-Infinity,pending:false};
   let sourcePosition=null,sourcePlaying=null,sourceKind=null,sourceAdvancedAt=0,hostState=null;
   let lastMeta='',lastLyrics='',lyricMode='waiting',lyricRevision=0,lastRnp=null,lastAppliedRnp=null;
   let pendingSeek=null,seekTimer=null,lastSeekId=0;
@@ -86,6 +87,33 @@
     if(update&&Array.isArray(update.lyrics)&&aliases().has(providerId(update))){setLyrics(update,true);return;}
     if(aliases().has(providerId(snapshot))){setLyrics(snapshot);return;}
     for(const [id,d]of [...rnpCache].reverse())if(aliases().has(id)){setLyrics(d);return;}
+  }
+  // Fallback source: RNP only publishes lyrics while its page is mounted, so a
+  // tray/mini NetEase window can stay silent. Fetch the song's LRC directly.
+  async function fetchRemoteLyrics(ncmId){
+    const url='https://music.163.com/api/song/lyric?id='+encodeURIComponent(ncmId)+'&lv=-1&kv=-1&tv=-1&rv=-1';
+    let response=null;
+    try{if(typeof window.betterncm?.fetch==='function')response=await window.betterncm.fetch(url);}catch{}
+    if(!response)try{response=await fetch(url,{credentials:'include'});}catch{}
+    if(!response||!response.ok)return null;
+    let data=null;try{data=await response.json();}catch{return null;}
+    const list=C.mergeLyrics(data?.lrc?.lyric??'',data?.tlyric?.lyric??'');
+    return list.length?list:null;
+  }
+  function maybeFetchLyrics(){
+    if(!player||!song.id||!song.ncmId||lyricMode!=='waiting'||remoteLyrics.pending)return;
+    const id=String(song.ncmId),now=performance.now();
+    if(remoteLyrics.songId===id&&now-remoteLyrics.at<60000)return;
+    remoteLyrics={songId:id,at:now,pending:true};
+    fetchRemoteLyrics(id).then(list=>{
+      if(stopped||!list||String(song.ncmId)!==id||lyricMode!=='waiting')return;
+      const normalized=C.normalizeLines(list);
+      if(!normalized.length)return;
+      const signature=JSON.stringify({mode:'timed',lines:normalized});
+      if(signature===lastLyrics)return;
+      lines=normalized;lyricMode='timed';lastLyrics=signature;
+      send({type:'lyrics',songId:song.id,revision:++lyricRevision,mode:lyricMode,lines});refreshStatus();
+    }).catch(e=>console.debug('[MiniLyrics] 直连歌词获取失败',e)).finally(()=>{remoteLyrics.pending=false;});
   }
   function sendRnpStyle(force=false){
     const classes=document.body?.classList,names=['smooth','sharp','lazy','easeout'];let curve=0;
@@ -226,7 +254,7 @@
   function tick(){
     if(stopped||socket?.readyState!==1)return;
     try{
-      attachPlayer();sample();sendRnpStyle();
+      attachPlayer();sample();sendRnpStyle();maybeFetchLyrics();
       if(playing&&clockValid&&!pendingSeek&&!playerTimelineFresh()){
         position=live();anchor=performance.now();clockValid=false;status='等待 网易云播放器 播放进度';sendClock();
       }
