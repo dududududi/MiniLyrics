@@ -1073,16 +1073,17 @@ class App {
  struct LayoutPanelGeometry {D2D1_RECT_F card,close,chips[3][3],fontMinus[2],fontPlus[2];};
  LayoutPanelGeometry panelGeometry()const{
   LayoutPanelGeometry p{};
-  float w=std::min(width-20.f,380.f),h=std::min(height-16.f,216.f);
+  float w=std::min(width-20.f,380.f),h=std::min(height-12.f,154.f);
   float x=(width-w)*.5f,y=(height-h)*.5f;
-  p.card=D2D1::RectF(x,y,x+w,y+h);p.close=D2D1::RectF(x+w-30,y+6,x+w-8,y+28);
-  float rowH=std::min(34.f,(h-48.f)/5.f),chipW=std::min(76.f,(w-88.f-24.f)/3.f);
-  for(int s=0;s<3;s++)for(int c=0;c<3;c++){float cx=x+76.f+c*(chipW+6.f),cy=y+38.f+s*rowH;p.chips[s][c]=D2D1::RectF(cx,cy,cx+chipW,cy+rowH-6.f);}
-  float fontTop=y+38.f+3*rowH+8.f;
+  p.card=D2D1::RectF(x,y,x+w,y+h);p.close=D2D1::RectF(x+w-26,y+7,x+w-8,y+25);
+  float rowH=std::min(38.f,(h-40.f)/3.f),left=x+12.f,labelW=42.f,gap=6.f;
+  float colRight=x+w-12.f,leftW=(colRight-142.f-8.f)-left;
+  float chipW=std::min(66.f,(leftW-labelW-2*gap)/3.f);
+  for(int s=0;s<3;s++)for(int c=0;c<3;c++){float cx=left+labelW+c*(chipW+gap),cy=y+32.f+s*rowH;p.chips[s][c]=D2D1::RectF(cx,cy,cx+chipW,cy+rowH-8.f);}
   for(int i=0;i<2;i++){
-   float top=fontTop+i*rowH,cy=top+(rowH-6.f)*.5f,bh=std::min(24.f,rowH-4.f),right=x+w-12.f;
-   p.fontPlus[i]=D2D1::RectF(right-22,cy-bh*.5f,right,cy+bh*.5f);
-   p.fontMinus[i]=D2D1::RectF(right-52,cy-bh*.5f,right-30,cy+bh*.5f);
+   float cy=y+32.f+i*rowH+(rowH-8.f)*.5f,bh=std::min(22.f,std::max(16.f,rowH-10.f));
+   p.fontPlus[i]=D2D1::RectF(colRight-20,cy-bh*.5f,colRight,cy+bh*.5f);
+   p.fontMinus[i]=D2D1::RectF(colRight-66,cy-bh*.5f,colRight-46,cy+bh*.5f);
   }
   return p;
  }
@@ -1110,14 +1111,18 @@ class App {
   if(open<1){float scale=.955f+.045f*open;t->SetTransform(D2D1::Matrix3x2F::Scale(scale,scale,D2D1::Point2F((p.card.left+p.card.right)*.5f,(p.card.top+p.card.bottom)*.5f))*D2D1::Matrix3x2F::Translation(0,(1-open)*6.f)*savedTransform);}
   g.brush->SetColor(D2D1::ColorF(.09f,.10f,.14f,.98f));t->FillRoundedRectangle(card,g.brush.get());
   g.brush->SetColor(D2D1::ColorF(.62f,.65f,.80f,.6f));t->DrawRoundedRectangle(card,g.brush.get(),1);
-  g.brush->SetColor(D2D1::ColorF(1,1,1,.55f));
-  t->DrawLine(D2D1::Point2F(p.close.left,p.close.top),D2D1::Point2F(p.close.right,p.close.bottom),g.brush.get(),1.4f);
-  t->DrawLine(D2D1::Point2F(p.close.right,p.close.top),D2D1::Point2F(p.close.left,p.close.bottom),g.brush.get(),1.4f);
+  // Compact close icon: smaller hit area with a thicker stroke.
+  float ins=4.5f;g.brush->SetColor(D2D1::ColorF(1,1,1,.58f));
+  t->DrawLine(D2D1::Point2F(p.close.left+ins,p.close.top+ins),D2D1::Point2F(p.close.right-ins,p.close.bottom-ins),g.brush.get(),2);
+  t->DrawLine(D2D1::Point2F(p.close.right-ins,p.close.top+ins),D2D1::Point2F(p.close.left+ins,p.close.bottom-ins),g.brush.get(),2);
   auto heading=layout(L"布局设置",format);
-  text(g,heading,p.card.left+14,p.card.top+12,D2D1::ColorF(.95f,.96f,.99f));
+  text(g,heading,p.card.left+12,p.card.top+9,D2D1::ColorF(.95f,.96f,.99f));
+  g.brush->SetColor(D2D1::ColorF(1,1,1,.08f));
+  float div=p.fontMinus[0].left-54.f;
+  t->DrawLine(D2D1::Point2F(div,p.card.top+30),D2D1::Point2F(div,p.card.bottom-10),g.brush.get(),1);
   for(int s=0;s<3;s++){
    Layout label=layout(s==0?L"左槽":s==1?L"右上":L"右下",format);
-   text(g,label,p.card.left+14,p.chips[s][0].top+(p.chips[s][0].bottom-p.chips[s][0].top-label.height)*.5f,D2D1::ColorF(.72f,.75f,.84f),.9f);
+   text(g,label,p.card.left+12,p.chips[s][0].top+(p.chips[s][0].bottom-p.chips[s][0].top-label.height)*.5f,D2D1::ColorF(.72f,.75f,.84f),.9f);
    for(int c=0;c<3;c++){
     int module=c==0?ModuleCover:c==1?ModuleLyrics:ModuleTitle;const auto&r=p.chips[s][c];bool active=slotModule[s]==module;
     g.brush->SetColor(D2D1::ColorF(1,1,1,active?.20f:.06f));t->FillRoundedRectangle(D2D1::RoundedRect(r,8,8),g.brush.get());
@@ -1126,18 +1131,16 @@ class App {
     text(g,chip,r.left+(r.right-r.left-chip.width)*.5f,r.top+(r.bottom-r.top-chip.height)*.5f,active?D2D1::ColorF(1,1,1):D2D1::ColorF(.80f,.83f,.90f),active?1.f:.85f);
    }
   }
-  g.brush->SetColor(D2D1::ColorF(1,1,1,.10f));
-  t->DrawLine(D2D1::Point2F(p.card.left+12,p.fontMinus[0].top-5),D2D1::Point2F(p.card.right-12,p.fontMinus[0].top-5),g.brush.get(),1);
   for(int i=0;i<2;i++){
    const auto&m=p.fontMinus[i],&pl=p.fontPlus[i];
    Layout label=layout(i==0?L"标题字号":L"歌词字号",format);
-   text(g,label,p.card.left+14,m.top+(m.bottom-m.top-label.height)*.5f,D2D1::ColorF(.72f,.75f,.84f),.9f);
+   text(g,label,m.left-8-label.width,(m.top+m.bottom-label.height)*.5f,D2D1::ColorF(.72f,.75f,.84f),.9f);
    for(int b=0;b<2;b++){
     const auto&r=b==0?m:pl;g.brush->SetColor(D2D1::ColorF(1,1,1,.08f));t->FillRoundedRectangle(D2D1::RoundedRect(r,6,6),g.brush.get());
-    g.brush->SetColor(D2D1::ColorF(1,1,1,.18f));t->DrawRoundedRectangle(D2D1::RoundedRect(r,6,6),g.brush.get(),1);
+    g.brush->SetColor(D2D1::ColorF(1,1,1,.20f));t->DrawRoundedRectangle(D2D1::RoundedRect(r,6,6),g.brush.get(),1);
     float cx=(r.left+r.right)*.5f,cy=(r.top+r.bottom)*.5f;
-    g.brush->SetColor(D2D1::ColorF(1,1,1,.85f));t->DrawLine(D2D1::Point2F(cx-4,cy),D2D1::Point2F(cx+4,cy),g.brush.get(),1.4f);
-    if(b==1)t->DrawLine(D2D1::Point2F(cx,cy-4),D2D1::Point2F(cx,cy+4),g.brush.get(),1.4f);
+    g.brush->SetColor(D2D1::ColorF(1,1,1,.88f));t->DrawLine(D2D1::Point2F(cx-4,cy),D2D1::Point2F(cx+4,cy),g.brush.get(),1.6f);
+    if(b==1)t->DrawLine(D2D1::Point2F(cx,cy-4),D2D1::Point2F(cx,cy+4),g.brush.get(),1.6f);
    }
    std::wstring value=std::to_wstring(int(std::lround(i==0?titleFontSize:currentFontSize)));
    Layout valueLayout=layout(value,format);
